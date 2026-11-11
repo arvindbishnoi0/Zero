@@ -9,25 +9,32 @@ on:
 
 jobs:
   build-apk:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Gradle Cache
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Run Core Engine & App Unit Tests
-        run: ./gradlew :core:engine:test testDebugUnitTest
-
-      - name: Assemble Debug APK
-        run: ./gradlew assembleDebug
+      - name: Run Unit Tests & Assemble Debug APK
+        run: |
+          set +e
+          ./gradlew :core:engine:test testDebugUnitTest assembleDebug --stacktrace > /tmp/gradle-build.log 2>&1
+          STATUS=$?
+          cat /tmp/gradle-build.log
+          if [ $STATUS -ne 0 ]; then
+            grep -E "^e: |FAILURE:|What went wrong:|^\* |^  > |error: |Execution failed" /tmp/gradle-build.log | head -n 40 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit $STATUS
+          fi
 
       - name: Upload VibeCut Pro Debug APK
         uses: actions/upload-artifact@v4
