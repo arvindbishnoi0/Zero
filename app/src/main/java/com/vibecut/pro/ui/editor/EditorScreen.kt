@@ -232,7 +232,7 @@ fun EditorScreen(
                     onRedo = viewModel::redo,
                     onImportMediaClick = {
                         pendingImportTrackType = TrackType.VIDEO_MAIN
-                        visualMediaPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoAndImage))
+                        visualMediaPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
                     },
                     onGenerateDemoClick = viewModel::generateAndImportSampleClips,
                     onDragSelectedOverlay = { dxNdc, dyNdc ->
@@ -271,7 +271,7 @@ fun EditorScreen(
                             TrackType.AUDIO_MUSIC, TrackType.AUDIO_VOICEOVER, TrackType.AUDIO_SFX ->
                                 audioFilePicker.launch("audio/*")
                             else ->
-                                visualMediaPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoAndImage))
+                                visualMediaPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
                         }
                     },
                     modifier = Modifier.weight(0.30f)

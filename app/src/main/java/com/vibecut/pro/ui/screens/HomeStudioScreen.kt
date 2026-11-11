@@ -175,7 +175,7 @@ fun HomeStudioScreen(
                     onSelectAspect = { selectedAspect = it },
                     onPickVideosQuick = {
                         multiVisualPicker.launch(
-                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoAndImage)
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
                         )
                     },
                     onOpenNewProjectModal = {
@@ -264,7 +264,7 @@ fun HomeStudioScreen(
                 selectedAspect = aspect
                 showNewProjectSheet = false
                 multiVisualPicker.launch(
-                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoAndImage)
+                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
                 )
             },
             onCreateBlank = { title, aspect ->
@@ -1063,7 +1063,7 @@ private fun TemplateApplyDialog(
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(
                         onClick = {
-                            clipPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoAndImage))
+                            clipPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
                         },
                         modifier = Modifier.weight(1f)
                     ) {
