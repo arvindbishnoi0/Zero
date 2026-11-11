@@ -2,14 +2,14 @@ name: VibeCut Pro Android Build & Tests
 
 on:
   push:
-    branches: [ "**" ]
+    branches: [ "main", "arena/**" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
   build-apk:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -19,6 +19,9 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
