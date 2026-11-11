@@ -1,0 +1,21 @@
+# Gradle & Android Studio
+.gradle/
+**/build/
+!gradle/wrapper/gradle-wrapper.jar
+local.properties
+*.iml
+.idea/
+.DS_Store
+*.apk
+*.aab
+*.ap_
+*.dex
+captures/
+.externalNativeBuild/
+.cxx/
+*.keystore
+*.jks
+
+# Environment files
+.env
+.env.local
