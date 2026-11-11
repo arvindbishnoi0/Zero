@@ -65,10 +65,10 @@ class OnDeviceVisionAiService @Inject constructor(
     }
 
     /**
-     * Samples downscaled 320x180 frames across [startMs..endMs] of a video clip and runs:
+     * Samples downscaled 320x180 frames across `startMs..endMs` of a video clip and runs:
      * - 24-bin RGB color histogram
      * - Sobel edge sharpness energy
-     * - Google ML Kit on-device Face Detection (when [detectFaces] is true)
+     * - Google ML Kit on-device Face Detection (when `detectFaces` is true)
      */
     suspend fun sampleClipFrames(
         videoUri: String,

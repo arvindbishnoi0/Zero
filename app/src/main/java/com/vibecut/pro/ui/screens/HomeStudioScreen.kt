@@ -239,7 +239,7 @@ fun HomeStudioScreen(
                 }
             }
 
-            if (banner != null) {
+            banner?.let { msg ->
                 Snackbar(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
@@ -248,7 +248,7 @@ fun HomeStudioScreen(
                         TextButton(onClick = viewModel::dismissBanner) { Text("OK", color = ElectricCyan) }
                     }
                 ) {
-                    Text(banner ?: "")
+                    Text(msg)
                 }
             }
         }

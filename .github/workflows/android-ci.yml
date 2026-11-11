@@ -2,7 +2,7 @@ name: VibeCut Pro Android Build & Tests
 
 on:
   push:
-    branches: [ "main", "arena/**" ]
+    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
