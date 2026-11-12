@@ -649,7 +649,9 @@ class VibeCutSceneOverlay(
     private val textClips: List<TimelineClip>,
     private val stickerClips: List<TimelineClip>,
     private val subtitles: List<SubtitleCue>,
-    canvasShortSide: Int = 1080
+    canvasShortSide: Int = 1080,
+    /** Offset of this export segment inside the clip (speed ramps split a clip into segments). */
+    private val sceneSegmentOffsetMs: Long = 0L
 ) : BitmapOverlay() {
 
     private val dims = AspectRatioPreset.dimensionsForProject(aspectRatio, canvasShortSide, customRatio)
@@ -665,11 +667,13 @@ class VibeCutSceneOverlay(
     private val pipBitmapCache = LinkedHashMap<String, Bitmap?>()
     private var lastRenderedBucketMs = -1L
     private var lastWasEmpty = true
+    /** True while [bitmap] holds a freshly drawn overlay that must not be reused for the same bucket. */
+    private var bitmapValid = false
     private var firstPtsUs: Long = C.TIME_UNSET
 
     override fun getBitmap(presentationTimeUs: Long): Bitmap {
         if (firstPtsUs == C.TIME_UNSET || presentationTimeUs < firstPtsUs) firstPtsUs = presentationTimeUs
-        val localClipMs = segmentOffsetMs + ((presentationTimeUs - firstPtsUs).coerceAtLeast(0L)) / 1000L
+        val localClipMs = sceneSegmentOffsetMs + ((presentationTimeUs - firstPtsUs).coerceAtLeast(0L)) / 1000L
         val globalTimelineMs = clipStartOnTimelineMs + localClipMs
 
         val activePips = pipClips.filter { globalTimelineMs in it.startTimeOnTrackMs..it.endTimeOnTrackMs }
@@ -682,13 +686,18 @@ class VibeCutSceneOverlay(
 
         if (activePips.isEmpty() && activeTexts.isEmpty() && activeStickers.isEmpty() && activeSubs.isEmpty()) {
             lastWasEmpty = true
+            bitmapValid = false
             return emptyBitmap
         }
 
+        // Re-render at most once per ~33 ms bucket; the same bucket on the next frame reuses the
+        // bitmap. The cache flag is what makes the reuse correct (the old `lastWasEmpty` gate could
+        // hand back a stale bitmap after an empty stretch).
         val bucketMs = globalTimelineMs / 33L
-        if (!lastWasEmpty && bucketMs == lastRenderedBucketMs) return bitmap
+        if (bitmapValid && bucketMs == lastRenderedBucketMs) return bitmap
         lastRenderedBucketMs = bucketMs
         lastWasEmpty = false
+        bitmapValid = true
 
         canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
 

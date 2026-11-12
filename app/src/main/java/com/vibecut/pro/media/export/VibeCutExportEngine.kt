@@ -16,6 +16,8 @@ import androidx.annotation.OptIn
 import androidx.core.content.FileProvider
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.Effect
+import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.transformer.*
 import com.vibecut.pro.engine.color.ColorGradingEngine
@@ -384,7 +386,7 @@ class VibeCutExportEngine @Inject constructor(
                     seqBuilder.addItem(
                         EditedMediaItem.Builder(mediaItem)
                             .setRemoveVideo(true)
-                            .setEffects(Effects(audioEffects.audioProcessors, emptyList()))
+                            .setEffects(Effects(audioEffects.audioProcessors, emptyList<Effect>()))
                             .build()
                     )
                     hasAnyMainAudio = true
@@ -457,10 +459,10 @@ class VibeCutExportEngine @Inject constructor(
                             .build()
                     )
                     .build()
-                val audioEffects = Effects(
-                    listOf(VibeCutDspAudioProcessor(ac, project, audioTrack.volume)),
-                    emptyList()
-                )
+                // Resolve the processor's explicit type: `Effects` takes List<AudioProcessor>
+                // and List<Effect>, so an untyped empty list is ambiguous here.
+                val audioProcessors: List<AudioProcessor> = listOf(VibeCutDspAudioProcessor(ac, audioTrack.volume))
+                val audioEffects = Effects(audioProcessors, emptyList<Effect>())
                 seqBuilder.addItem(
                     EditedMediaItem.Builder(item)
                         .setRemoveVideo(true)
@@ -650,7 +652,7 @@ class VibeCutExportEngine @Inject constructor(
 
                 // Burn-in Scene Overlays (PIP, Text, Subtitles, Stickers)
                 val pipClips = project.tracks
-                    .filter { (it.type == TrackType.VIDEO_PIP || it.type == TrackType.OVERLAY) && !it.isHidden }
+                    .filter { it.type == TrackType.VIDEO_PIP && !it.isHidden }
                     .flatMap { it.clips }
                 val textClips = project.tracks
                     .filter { it.type == TrackType.TEXT && !it.isHidden }
@@ -662,6 +664,7 @@ class VibeCutExportEngine @Inject constructor(
                     val overlayRenderer = VibeCutSceneOverlay(
                         context = context,
                         aspectRatio = project.aspectRatio,
+                        customRatio = project.customAspectRatio,
                         clipStartOnTimelineMs = clip.startTimeOnTrackMs,
                         pipClips = pipClips,
                         textClips = textClips,
