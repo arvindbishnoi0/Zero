@@ -20,6 +20,7 @@ import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -77,6 +78,7 @@ fun ProTimeline(
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current
+    val scope = rememberCoroutineScope()
     val hScroll = rememberScrollState()
     val vScroll = rememberScrollState()
     val totalMs = project.totalDurationMs.coerceAtLeast(1000L)
@@ -115,7 +117,7 @@ fun ProTimeline(
             onFit = {
                 val seconds = (totalMs / 1000f).coerceAtLeast(1f)
                 viewport.setZoom((viewportWidthPx / seconds).coerceIn(10f, 400f))
-                hScroll.scrollTo(0)
+                scope.launch { hScroll.scrollTo(0) }
             }
         )
 
@@ -137,11 +139,14 @@ fun ProTimeline(
                     .pointerInput(viewport.pxPerSecond) {
                         detectTransformGestures { centroid, _, zoom, _ ->
                             if (abs(zoom - 1f) > 0.02f) {
+                                // Zoom around the pinch centroid so the frame under the fingers stays put.
                                 val focusMs = viewport.pxToMs(centroid.x + hScroll.value)
                                 viewport.zoomBy(zoom)
-                                hScroll.scrollTo(
-                                    (viewport.msToPx(focusMs) - centroid.x).roundToInt().coerceAtLeast(0)
-                                )
+                                scope.launch {
+                                    hScroll.scrollTo(
+                                        (viewport.msToPx(focusMs) - centroid.x).roundToInt().coerceAtLeast(0)
+                                    )
+                                }
                             }
                         }
                     }

@@ -32,6 +32,7 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import com.vibecut.pro.engine.model.*
+import com.vibecut.pro.ui.editor.components.PreviewOverlays
 import com.vibecut.pro.ui.editor.components.UniversalMediaImporterSheet
 import com.vibecut.pro.ui.editor.panels.*
 import com.vibecut.pro.ui.editor.timeline.ProTimeline

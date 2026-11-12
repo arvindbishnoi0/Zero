@@ -183,6 +183,19 @@ fun formatDurationShort(ms: Long): String {
 }
 
 /** `+12` / `-8` / `0` for signed sliders. */
+/** Compact duration used on project cards and media tiles (`0:07`, `1:24`, `12:03`). */
+fun formatCompactDuration(ms: Long): String {
+    val totalSeconds = (ms.coerceAtLeast(0L) / 1000L)
+    val minutes = totalSeconds / 60L
+    val seconds = totalSeconds % 60L
+    return if (minutes >= 60L) {
+        val hours = minutes / 60L
+        String.format(java.util.Locale.US, "%d:%02d:%02d", hours, minutes % 60L, seconds)
+    } else {
+        String.format(java.util.Locale.US, "%d:%02d", minutes, seconds)
+    }
+}
+
 fun formatSignedPercent(value: Float): String {
     val v = (value * 100).roundToInt()
     return when {

@@ -801,11 +801,12 @@ private fun TransitionSheet(clip: TimelineClip?, viewModel: EditorViewModel) {
                 }
             }
         }
-        if (clip.transitionIn != null) {
+        val transitionIn = clip.transitionIn
+        if (transitionIn != null) {
             StudioPrimaryButton(
                 text = "Apply this transition to all clips",
                 icon = Icons.Default.Layers,
-                onClick = { viewModel.applyTransitionToAllClips(clip.transitionIn) }
+                onClick = { viewModel.applyTransitionToAllClips(transitionIn) }
             )
         }
     }
