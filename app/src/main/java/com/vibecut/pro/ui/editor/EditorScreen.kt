@@ -66,10 +66,11 @@ fun EditorScreen(
         EditorInspectorTab.FILTERS,
         EditorInspectorTab.DETAIL,
         EditorInspectorTab.ADJUST,
-        EditorInspectorTab.EFFECTS,
-        EditorInspectorTab.AI
+        EditorInspectorTab.EFFECTS
     )
-    val showCompactTimeline = isCustomizationFocusedTab && !forceFullTimelineInStudio
+    // Keep the full, directly-manipulable multi-track timeline visible in every editor tab.
+    // The compact strip hid the actual lanes precisely when users needed editing controls.
+    val showCompactTimeline = false
 
     Scaffold(
         containerColor = ObsidianBg,
@@ -185,7 +186,7 @@ fun EditorScreen(
                 horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 val g = activeVisualClip?.colorGrade
-                EditorInspectorTab.entries.forEach { tab ->
+                EditorInspectorTab.entries.filterNot { it == EditorInspectorTab.AI }.forEach { tab ->
                     val selected = uiState.activeTab == tab
                     val icon = when (tab) {
                         EditorInspectorTab.EDIT -> Icons.Default.ContentCut
