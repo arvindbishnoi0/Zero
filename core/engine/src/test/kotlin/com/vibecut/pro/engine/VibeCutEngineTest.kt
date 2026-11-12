@@ -619,7 +619,7 @@ class VibeCutEngineTest {
         assertEquals(1920, lw)
 
         // A custom 4:5 ratio is honoured, and every output is macroblock aligned.
-        val (cw, ch) = AspectRatioPreset.computeDimensionsFor(AspectRatioPreset.CUSTOM, 1080, 0.8f)
+        val (cw, ch) = AspectRatioPreset.CUSTOM.computeDimensionsFor(1080, 0.8f)
         assertEquals(1080, ch)
         assertTrue("4:5 custom width ~1350, got $cw", abs(cw - 1350) <= 16)
         listOf(
