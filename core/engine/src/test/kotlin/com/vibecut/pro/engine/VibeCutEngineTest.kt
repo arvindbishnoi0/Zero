@@ -296,15 +296,17 @@ class VibeCutEngineTest {
         project = TimelineEngine.trimClip(project, middle.id, middle.trimStartMs, middle.trimStartMs + 1_000L)
         assertEquals(2_000L, project.mainVideoClips[1].trimmedSourceDurationMs)
 
-        // moving a clip on a magnetic track reflows instead of overlapping
+        // moving a clip to the front of a magnetic track reflows instead of overlapping
         val lastId = project.mainVideoClips.last().id
         project = TimelineEngine.moveClipToTimestamp(project, lastId, 0L)
         val ordered = project.mainVideoClips.sortedBy { it.startTimeOnTrackMs }
+        assertEquals(lastId, ordered.first().id)
         var cursor = 0L
         ordered.forEach { clip ->
             assertEquals(cursor, clip.startTimeOnTrackMs)
             cursor += clip.timelineDurationMs
         }
+        assertEquals(cursor, project.totalDurationMs)
     }
 
     @Test
@@ -497,7 +499,10 @@ class VibeCutEngineTest {
         var project = twoClipProject()
         val clipId = project.mainVideoClips[0].id
         project = TimelineEngine.setClipSpeed(
-            project, clipId, 1f, SpeedCurvePreset.NONE, SpeedCurvePreset.MONTAGE.defaultPoints
+            project,
+            clipId,
+            speed = 1f,
+            curvePreset = SpeedCurvePreset.MONTAGE
         )
         val clip = project.findClip(clipId)!!
         assertTrue(clip.hasSpeedRamp)
@@ -616,7 +621,9 @@ class VibeCutEngineTest {
         assertTrue("portrait must be taller", ph > pw)
         val (lw, lh) = AspectRatioPreset.dimensionsForProject(AspectRatioPreset.YOUTUBE_16_9, 1080, 0.5625f)
         assertTrue("landscape must be wider", lw > lh)
-        assertEquals(1920, lw)
+        // 1080 is the short side, so a 16:9 frame is 1920x1080.
+        assertEquals(1080, lh)
+        assertTrue("landscape width ~1920, got $lw", abs(lw - 1920) <= 16)
 
         // A custom 4:5 ratio is honoured, and every output is macroblock aligned.
         val (cw, ch) = AspectRatioPreset.CUSTOM.computeDimensionsFor(1080, 0.8f)
@@ -636,7 +643,8 @@ class VibeCutEngineTest {
                 assertTrue(w > 0 && h > 0)
             }
         }
-        assertEquals(AspectRatioPreset.REELS_9_16, AspectRatioPreset.fromId("REELS_9_16"))
+        assertEquals(AspectRatioPreset.REELS_9_16, AspectRatioPreset.fromId("9:16"))
+        assertEquals(AspectRatioPreset.SQUARE_1_1, AspectRatioPreset.fromId("1:1"))
         // Unknown ids fall back to the default ratio instead of crashing a saved project.
         assertEquals(AspectRatioPreset.REELS_9_16, AspectRatioPreset.fromId("nonsense"))
     }
