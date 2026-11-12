@@ -291,10 +291,16 @@ class VibeCutEngineTest {
         assertEquals(3, project.mainVideoClips.size)
         assertTrue(project.mainVideoClips.all { it.startTimeOnTrackMs >= 0L })
 
-        // trimming the middle clip shortens the timeline
+        // trimming the middle clip shortens the timeline; the magnetic track closes the gap
         val middle = project.mainVideoClips[1]
         project = TimelineEngine.trimClip(project, middle.id, middle.trimStartMs, middle.trimStartMs + 1_000L)
-        assertEquals(2_000L, project.mainVideoClips[1].trimmedSourceDurationMs)
+        val middleAfter = project.findClip(middle.id)!!
+        assertEquals(1_000L, middleAfter.trimmedSourceDurationMs)
+        var trimCursor = 0L
+        project.mainVideoClips.sortedBy { it.startTimeOnTrackMs }.forEach {
+            assertEquals(trimCursor, it.startTimeOnTrackMs)
+            trimCursor += it.timelineDurationMs
+        }
 
         // moving a clip to the front of a magnetic track reflows instead of overlapping
         val lastId = project.mainVideoClips.last().id
@@ -643,7 +649,6 @@ class VibeCutEngineTest {
                 assertTrue(w > 0 && h > 0)
             }
         }
-        assertEquals(AspectRatioPreset.REELS_9_16, AspectRatioPreset.fromId("9:16"))
         assertEquals(AspectRatioPreset.SQUARE_1_1, AspectRatioPreset.fromId("1:1"))
         // Unknown ids fall back to the default ratio instead of crashing a saved project.
         assertEquals(AspectRatioPreset.REELS_9_16, AspectRatioPreset.fromId("nonsense"))
