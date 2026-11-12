@@ -32,7 +32,7 @@ object SubtitleCodec {
                 shadowColorArgb = 0xFFE040FB,
                 outlineWidth = 3f,
                 outlineColorArgb = 0xFF12002B,
-                animationIn = TextAnimationType.GLITCH_IN
+                animationIn = TextAnimationType.POP_BOUNCE
             )
         ),
         TextTemplatePreset(
@@ -48,7 +48,7 @@ object SubtitleCodec {
                 useGradient = true,
                 letterSpacingEm = 0.22f,
                 shadowRadius = 10f,
-                animationIn = TextAnimationType.CINEMATIC_TRACKING
+                animationIn = TextAnimationType.SLIDE_IN
             )
         ),
         TextTemplatePreset(
@@ -124,7 +124,7 @@ object SubtitleCodec {
                 useGradient = true,
                 shadowRadius = 12f,
                 shadowColorArgb = 0xFF00E676,
-                animationIn = TextAnimationType.KARAOKE_GLOW
+                animationIn = TextAnimationType.KARAOKE
             )
         ),
         TextTemplatePreset(
