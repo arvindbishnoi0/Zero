@@ -13,6 +13,11 @@ concurrency:
   group: zero-${{ github.ref }}
   cancel-in-progress: true
 
+# The publish step creates/updates the `zero-latest` release, which needs write access to
+# repository contents. Without this the default token is read-only and the step fails.
+permissions:
+  contents: write
+
 jobs:
   test-and-build:
     name: Test • Debug • Signed Release
