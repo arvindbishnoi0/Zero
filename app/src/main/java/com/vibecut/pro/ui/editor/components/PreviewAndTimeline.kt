@@ -577,6 +577,7 @@ fun MultiTrackTimeline(
     val totalTimelineSec = max(10f, (project.totalDurationMs / 1000f) + 4f)
     val timelineContentWidth: Dp = (totalTimelineSec * dpPerSec).dp
     val scrollState = rememberScrollState()
+    val verticalScroll = rememberScrollState()
     val density = LocalDensity.current
 
     Column(
