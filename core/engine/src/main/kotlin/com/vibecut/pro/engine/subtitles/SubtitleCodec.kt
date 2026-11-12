@@ -93,8 +93,6 @@ object SubtitleCodec {
                 textColorArgb = 0xFF69F0AE,
                 outlineWidth = 4f,
                 outlineColorArgb = 0xFF004D40,
-                is3dExtruded = true,
-                extrudeDepth = 8f,
                 animationIn = TextAnimationType.POP_BOUNCE
             )
         ),

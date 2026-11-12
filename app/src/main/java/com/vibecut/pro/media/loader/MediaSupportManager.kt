@@ -42,6 +42,8 @@ data class MediaImportProgress(
 ) {
     val currentItemName: String get() = currentFileName
     val stageDescription: String get() = stageLabel
+    /** True while a batch import is running (drives the progress card in the importer sheet). */
+    val isActive: Boolean get() = isImporting
     val fraction: Float
         get() = if (!isImporting || totalCount <= 0) 0f
         else ((currentIndex - 1).coerceAtLeast(0).toFloat() + 0.5f) / totalCount.toFloat()

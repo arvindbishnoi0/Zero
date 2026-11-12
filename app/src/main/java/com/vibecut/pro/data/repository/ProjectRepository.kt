@@ -3,14 +3,11 @@ package com.vibecut.pro.data.repository
 import android.content.Context
 import com.vibecut.pro.data.local.ProjectEntity
 import com.vibecut.pro.data.local.ProjectRevisionEntity
-import com.vibecut.pro.data.local.SavedTemplateEntity
 import com.vibecut.pro.data.local.VibeCutDao
 import com.vibecut.pro.engine.model.AspectRatioPreset
 import com.vibecut.pro.engine.model.Project
 import com.vibecut.pro.engine.model.TrackType
 import com.vibecut.pro.engine.serialization.ProjectJsonCodec
-import com.vibecut.pro.engine.templates.ProjectTemplate
-import com.vibecut.pro.engine.templates.TemplateCatalog
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -50,13 +47,6 @@ class ProjectRepository @Inject constructor(
                 revision = entity.revision
             )
         }
-    }
-
-    val allTemplatesFlow: Flow<List<ProjectTemplate>> = dao.observeSavedTemplates().map { saved ->
-        val userTemplates = saved.mapNotNull {
-            runCatching { ProjectJsonCodec.decodeTemplate(it.templateJson) }.getOrNull()
-        }
-        userTemplates + TemplateCatalog.builtInTemplates
     }
 
     suspend fun createNewProject(
@@ -157,23 +147,6 @@ class ProjectRepository @Inject constructor(
         )
         saveProject(restored, recordRevisionSummary = "Restored rev #${revision.revisionNumber}")
         restored
-    }
-
-    suspend fun saveCustomTemplate(template: ProjectTemplate) = withContext(Dispatchers.IO) {
-        val json = ProjectJsonCodec.encodeTemplate(template)
-        dao.upsertTemplate(
-            SavedTemplateEntity(
-                id = template.id,
-                name = template.name,
-                categoryName = template.category.name,
-                templateJson = json,
-                createdAtMs = System.currentTimeMillis()
-            )
-        )
-    }
-
-    suspend fun deleteCustomTemplate(templateId: String) = withContext(Dispatchers.IO) {
-        dao.deleteTemplate(templateId)
     }
 
     suspend fun computeCacheBytes(): Long = withContext(Dispatchers.IO) {

@@ -39,12 +39,3 @@ data class ProjectRevisionEntity(
     val projectJson: String,
     val savedAtMs: Long
 )
-
-@Entity(tableName = "saved_templates")
-data class SavedTemplateEntity(
-    @PrimaryKey val id: String,
-    val name: String,
-    val categoryName: String,
-    val templateJson: String,
-    val createdAtMs: Long
-)

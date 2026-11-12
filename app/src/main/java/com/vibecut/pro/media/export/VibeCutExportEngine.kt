@@ -185,7 +185,9 @@ class VibeCutExportEngine @Inject constructor(
 
         var anyMainClipKeepsAudio = false
 
-        val mainEditedItems = mainClips.map { clip ->
+        val segments = planMainSegments(mainClips)
+        val mainEditedItems = segments.map { segment ->
+            val clip = segment.clip
             val clipUri = parseMediaUri(clip.sourceUri)
             val isImageItem = clip.mediaKind == MediaKind.IMAGE
             val hasRealAudio = !isImageItem &&
@@ -202,18 +204,18 @@ class VibeCutExportEngine @Inject constructor(
                 MediaItem.Builder()
                     .setUri(clipUri)
                     .setMimeType(clip.mimeType.ifBlank { MimeTypes.IMAGE_JPEG })
-                    .setImageDurationMs(clip.timelineDurationMs.coerceAtLeast(100L))
+                    .setImageDurationMs(segment.timelineDurationMs.coerceAtLeast(100L))
                     .build()
             } else {
                 val startPosMs = if (clip.isFrozenFrame) {
                     clip.freezeFrameSourceMs.coerceAtLeast(0L)
                 } else {
-                    clip.trimStartMs.coerceAtLeast(0L)
+                    segment.sourceStartMs.coerceAtLeast(0L)
                 }
                 val rawEndMs = if (clip.isFrozenFrame) {
                     (startPosMs + 120L).coerceAtMost(clip.sourceDurationMs.coerceAtLeast(startPosMs + 80L))
                 } else {
-                    clip.effectiveTrimEndMs
+                    segment.sourceEndMs
                 }
                 val safeEndMs = rawEndMs.coerceAtLeast(startPosMs + 60L)
                 MediaItem.Builder()
@@ -229,7 +231,7 @@ class VibeCutExportEngine @Inject constructor(
 
             val effects = ClipEffectsFactory.buildFullClipEffects(
                 context = context,
-                clip = clip,
+                clip = segment.effectiveClip,
                 project = project,
                 trackVolume = if (mainTrack.isMuted) 0f else mainTrack.volume,
                 includeAudioProcessor = !removeAudio,
@@ -246,7 +248,7 @@ class VibeCutExportEngine @Inject constructor(
                 .setEffects(effects)
 
             if (isImageItem) {
-                itemBuilder.setDurationUs(clip.timelineDurationMs.coerceAtLeast(100L) * 1_000L)
+                itemBuilder.setDurationUs(segment.timelineDurationMs.coerceAtLeast(100L) * 1_000L)
             }
             itemBuilder.build()
         }
@@ -301,6 +303,94 @@ class VibeCutExportEngine @Inject constructor(
         )
     }
 
+
+    /**
+     * One renderable slice of the main track.
+     *
+     * Media3 speed changers only implement a *constant* speed, so a speed ramp is exported by
+     * slicing the clip at the ramp's control points: every slice gets a constant speed (the
+     * midpoint speed of that slice) and the slices are then concatenated inside a single
+     * sequence, which reproduces the ramp on the timeline without lying about it.
+     */
+    private data class RenderSegment(
+        val clip: TimelineClip,
+        /** Clip copy whose speed/frozen frame is narrowed down to this slice. */
+        val effectiveClip: TimelineClip,
+        val sourceStartMs: Long,
+        val sourceEndMs: Long,
+        /** Duration this slice occupies on the timeline (after speed). */
+        val timelineDurationMs: Long
+    )
+
+    /**
+     * Turns the main-track clips into constant-speed render segments.
+     *
+     * Clips without a speed ramp produce exactly one segment and are passed through untouched
+     * (bit-for-bit identical to the previous exporter behaviour). Ramped clips are split at every
+     * curve breakpoint plus sub-steps, so the piecewise-constant approximation stays within a few
+     * percent of the analytic curve.
+     */
+    private fun planMainSegments(clips: List<TimelineClip>): List<RenderSegment> {
+        val out = ArrayList<RenderSegment>(clips.size)
+        for (clip in clips) {
+            if (!clip.hasSpeedRamp || clip.isFrozenFrame || clip.mediaKind != MediaKind.VIDEO) {
+                out.add(
+                    RenderSegment(
+                        clip = clip,
+                        effectiveClip = clip,
+                        sourceStartMs = clip.trimStartMs,
+                        sourceEndMs = clip.effectiveTrimEndMs,
+                        timelineDurationMs = clip.timelineDurationMs
+                    )
+                )
+                continue
+            }
+
+            val srcSpan = clip.trimmedSourceDurationMs.toFloat().coerceAtLeast(1f)
+            val points = clip.activeSpeedPoints
+            // Breakpoints (normalized position along the clip) + fixed sub-steps for smoothness.
+            val cuts = sortedSetOf(0f, 1f)
+            points.forEach { cuts.add(it.normalizedPosition.coerceIn(0f, 1f)) }
+            var u = 0f
+            while (u < 1f) {
+                cuts.add(u.coerceIn(0f, 1f))
+                u += 0.08f
+            }
+            val ordered = cuts.toList()
+            for (i in 0 until ordered.lastIndex) {
+                val uStart = ordered[i]
+                val uEnd = ordered[i + 1]
+                if (uEnd - uStart < 0.004f) continue
+                val midU = (uStart + uEnd) * 0.5f
+                val sliceSpeed = clip.playbackSpeedAt((midU * clip.timelineDurationMs))
+                    .coerceIn(SpeedCurvePreset.MIN_SPEED, SpeedCurvePreset.MAX_SPEED)
+                val sourceStart = (clip.trimStartMs + (uStart * srcSpan)).toLong()
+                val sourceEnd = (clip.trimStartMs + (uEnd * srcSpan)).toLong()
+                if (sourceEnd - sourceStart < 24L) continue
+                val sliceTimelineMs = ((sourceEnd - sourceStart) / sliceSpeed).toLong().coerceAtLeast(16L)
+                val slice = clip.copy(
+                    speed = sliceSpeed,
+                    speedCurvePreset = SpeedCurvePreset.NONE,
+                    speedCurvePoints = emptyList(),
+                    trimStartMs = sourceStart,
+                    trimEndMs = sourceEnd,
+                    transitionIn = if (i == 0) clip.transitionIn else null,
+                    transitionOut = if (i == ordered.lastIndex - 1) clip.transitionOut else null
+                )
+                out.add(
+                    RenderSegment(
+                        clip = clip,
+                        effectiveClip = slice,
+                        sourceStartMs = sourceStart,
+                        sourceEndMs = sourceEnd,
+                        timelineDurationMs = sliceTimelineMs
+                    )
+                )
+            }
+        }
+        return out
+    }
+
     private suspend fun exportAudioOnlyInternal(
         project: Project,
         config: ExportConfig
@@ -344,7 +434,8 @@ class VibeCutExportEngine @Inject constructor(
                         includeAudioProcessor = true,
                         includeSceneOverlays = false,
                         targetExportHeight = null,
-                        targetFps = null
+                        targetFps = null,
+                        useCodecSafeAlignment = false
                     )
                     seqBuilder.addItem(
                         EditedMediaItem.Builder(mediaItem)
@@ -408,32 +499,34 @@ class VibeCutExportEngine @Inject constructor(
                     seqBuilder.addGap(startUs - cursorUs)
                     cursorUs = startUs
                 }
-                val maxClipDurMs = ((totalTimelineUs - cursorUs) / 1_000L).coerceAtLeast(80L)
+                val remainingTimelineMs = ((totalTimelineUs - cursorUs) / 1_000L).coerceAtLeast(80L)
+                val clipTimelineMs = ac.timelineDurationMs.coerceAtMost(remainingTimelineMs).coerceAtLeast(60L)
                 val clipStartMs = ac.trimStartMs.coerceAtLeast(0L)
-                val endTrimMs = minOf(ac.effectiveTrimEndMs, clipStartMs + maxClipDurMs)
-                    .coerceAtLeast(clipStartMs + 60L)
+                val clipEndMs = ac.mapTimelineOffsetToSourceMs(clipTimelineMs)
+                    .coerceIn(clipStartMs + 60L, ac.effectiveTrimEndMs.coerceAtLeast(clipStartMs + 60L))
 
                 val item = MediaItem.Builder()
                     .setUri(parseMediaUri(ac.sourceUri))
                     .setClippingConfiguration(
                         MediaItem.ClippingConfiguration.Builder()
                             .setStartPositionMs(clipStartMs)
-                            .setEndPositionMs(endTrimMs)
+                            .setEndPositionMs(clipEndMs)
                             .build()
                     )
                     .build()
                 val audioEffects = Effects(
-                    listOf(VibeCutDspAudioProcessor(ac, project, audioTrack.volume)),
+                    listOf(VibeCutDspAudioProcessor(ac, audioTrack.volume)),
                     emptyList()
                 )
                 seqBuilder.addItem(
                     EditedMediaItem.Builder(item)
                         .setRemoveVideo(true)
+                        .setDurationUs(clipTimelineMs * 1_000L)
                         .setEffects(audioEffects)
                         .build()
                 )
                 addedAnyItem = true
-                cursorUs += (endTrimMs - clipStartMs) * 1_000L
+                cursorUs += clipTimelineMs * 1_000L
             }
             if (addedAnyItem) {
                 result.add(seqBuilder.build())
@@ -553,7 +646,10 @@ class VibeCutExportEngine @Inject constructor(
                 val sourceFrame = decodeHighResClipFrame(clip, localOffsetMs)
                     ?: throw IllegalStateException("Unable to decode frame from '${clip.sourceName}'.")
 
-                val (targetW, targetH) = project.aspectRatio.computeDimensions(config.resolution.shortSidePx)
+                val (targetW, targetH) = project.aspectRatio.computeDimensionsFor(
+                    config.resolution.shortSidePx,
+                    project.customAspectRatio
+                )
                 val outBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
                 val canvas = Canvas(outBitmap)
                 canvas.drawColor(Color.BLACK)
@@ -569,10 +665,19 @@ class VibeCutExportEngine @Inject constructor(
 
                 // Fit inside target canvas + apply Keyframed Transform
                 val kf = KeyframeInterpolator.evaluateClipState(clip, localOffsetMs)
-                val fitScale = min(
-                    targetW.toFloat() / max(1, croppedFrame.width).toFloat(),
-                    targetH.toFloat() / max(1, croppedFrame.height).toFloat()
-                )
+                // Cropped frames fill the canvas (like the preview's crop zoom); uncropped frames are
+                // letterboxed with scale-to-fit so nothing is stretched.
+                val fitScale = if (clip.crop.isIdentity) {
+                    min(
+                        targetW.toFloat() / max(1, croppedFrame.width).toFloat(),
+                        targetH.toFloat() / max(1, croppedFrame.height).toFloat()
+                    )
+                } else {
+                    max(
+                        targetW.toFloat() / max(1, croppedFrame.width).toFloat(),
+                        targetH.toFloat() / max(1, croppedFrame.height).toFloat()
+                    )
+                }
                 val drawMatrix = Matrix().apply {
                     postTranslate(-croppedFrame.width / 2f, -croppedFrame.height / 2f)
                     postScale(fitScale * kf.scaleX, fitScale * kf.scaleY)
@@ -615,7 +720,7 @@ class VibeCutExportEngine @Inject constructor(
 
                 // Burn-in Scene Overlays (PIP, Text, Subtitles, Stickers)
                 val pipClips = project.tracks
-                    .filter { (it.type == TrackType.VIDEO_PIP || it.type == TrackType.OVERLAY) && !it.isHidden }
+                    .filter { it.type == TrackType.VIDEO_PIP && !it.isHidden }
                     .flatMap { it.clips }
                 val textClips = project.tracks
                     .filter { it.type == TrackType.TEXT && !it.isHidden }
@@ -627,11 +732,13 @@ class VibeCutExportEngine @Inject constructor(
                     val overlayRenderer = VibeCutSceneOverlay(
                         context = context,
                         aspectRatio = project.aspectRatio,
+                        customRatio = project.customAspectRatio,
                         clipStartOnTimelineMs = clip.startTimeOnTrackMs,
                         pipClips = pipClips,
                         textClips = textClips,
                         stickerClips = stickerClips,
-                        subtitles = project.subtitles
+                        subtitles = project.subtitles,
+                        canvasShortSide = min(targetW, targetH)
                     )
                     // First call initializes firstPtsUs = 0L; second call renders at localOffsetMs
                     overlayRenderer.getBitmap(0L)

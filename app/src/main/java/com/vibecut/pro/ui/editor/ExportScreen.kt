@@ -1,9 +1,8 @@
 package com.vibecut.pro.ui.editor
 
 import android.content.Intent
-import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -11,13 +10,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vibecut.pro.engine.model.*
@@ -25,300 +24,239 @@ import com.vibecut.pro.media.export.ExportProgressState
 import com.vibecut.pro.ui.theme.*
 import java.util.Locale
 
+/**
+ * Export sheet: resolution, frame rate, codec, bitrate, audio and the real output estimate.
+ *
+ * The pipeline is the same one used in the editor — Media3 Transformer with the ZERO GPU effect
+ * factory — so effects, colour, transitions, overlays, text and audio DSP are all baked into the
+ * file. Nothing here is a mock progress bar: the percentage comes from Transformer.getProgress().
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ExportStudioSheet(
+fun ExportSheet(
     project: Project,
     isHevcSupported: Boolean,
     exportState: ExportProgressState,
-    onUpdateConfig: (ExportConfig) -> Unit,
-    onStartExport: () -> Unit,
-    onCancelExport: () -> Unit,
-    onResetState: () -> Unit,
-    onBuildShareIntent: (String, Boolean, Boolean) -> Intent?,
+    encoders: List<String>,
+    onConfigChange: (ExportConfig) -> Unit,
+    onStart: () -> Unit,
+    onCancel: () -> Unit,
+    onReset: () -> Unit,
+    onShare: (String, Boolean, Boolean) -> Intent?,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
     val cfg = project.exportConfig
-    val estimatedMb = cfg.estimatedFileSizeMb(project.totalDurationMs, project.aspectRatio)
-    val bitrateMbps = cfg.targetVideoBitrateBps(project.aspectRatio) / 1_000_000f
+    val estimatedMb = cfg.estimatedFileSizeMb(project.totalDurationMs, project.aspectRatio, project.customAspectRatio)
+    val bitrateMbps = cfg.targetVideoBitrateBps(project.aspectRatio, project.customAspectRatio) / 1_000_000f
+    var codecUnavailable by remember { mutableStateOf(false) }
 
     ModalBottomSheet(
         onDismissRequest = {
             if (exportState !is ExportProgressState.Running) {
-                onResetState()
+                onReset()
                 onDismiss()
             }
         },
-        containerColor = PanelDark
+        containerColor = ZeroBackground,
+        contentColor = TextPrimary,
+        dragHandle = { BottomSheetDefaults.DragHandle(color = ZeroStroke) }
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp, vertical = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 26.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text("Export Studio", style = MaterialTheme.typography.titleLarge)
+            SheetHeader(
+                title = "Export",
+                subtitle = if (project.totalDurationMs > 0) {
+                    "${project.aspectRatio.badge} • ${formatDurationShort(project.totalDurationMs)}"
+                } else "Add clips before exporting",
+                onClose = { if (exportState !is ExportProgressState.Running) onDismiss() }
+            )
 
             when (exportState) {
-                is ExportProgressState.Running -> {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 22.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(14.dp)
-                    ) {
-                        CircularProgressIndicator(
-                            progress = { exportState.percent / 100f },
-                            modifier = Modifier.size(84.dp),
-                            color = ElectricCyan,
-                            strokeWidth = 6.dp
-                        )
-                        Text("${exportState.percent}%", fontSize = 24.sp, fontWeight = FontWeight.ExtraBold)
-                        Text(exportState.statusLabel, fontSize = 12.sp, color = TextSecondary)
-                        OutlinedButton(onClick = onCancelExport) {
-                            Text("Cancel Export", color = CoralRed)
-                        }
-                    }
-                }
+                is ExportProgressState.Running -> RunningExport(exportState, onCancel)
 
-                is ExportProgressState.Completed -> {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 10.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Icon(
-                            Icons.Default.CheckCircle,
-                            contentDescription = null,
-                            tint = EmeraldBeat,
-                            modifier = Modifier.size(56.dp)
-                        )
-                        val titleLabel = when {
-                            exportState.isPhotoFrame -> "Photo Saved!"
-                            exportState.audioOnly -> "Audio Master Saved!"
-                            else -> "Video Export Completed!"
-                        }
-                        Text(titleLabel, style = MaterialTheme.typography.titleLarge, color = EmeraldBeat)
-                        val actualMb = String.format(Locale.US, "%.2f MB", exportState.fileSizeBytes / (1024f * 1024f))
-                        Text(
-                            text = "Size: $actualMb ${if (exportState.galleryUri != null) "• Saved to Device Gallery" else ""}",
-                            fontSize = 12.sp,
-                            color = TextSecondary
-                        )
-
-                        Button(
-                            onClick = {
-                                onBuildShareIntent(
-                                    exportState.outputFilePath,
-                                    exportState.audioOnly,
-                                    exportState.isPhotoFrame
-                                )?.let { intent ->
-                                    context.startActivity(Intent.createChooser(intent, "Share Export"))
-                                }
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan, contentColor = Color.Black),
-                            shape = RoundedCornerShape(12.dp)
-                        ) {
-                            Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("Share Export", fontWeight = FontWeight.Bold)
-                        }
-
-                        TextButton(onClick = {
-                            onResetState()
-                            onDismiss()
-                        }) {
-                            Text("Done")
-                        }
-                    }
-                }
-
-                else -> {
-                    if (exportState is ExportProgressState.Error) {
-                        Surface(
-                            color = CoralRed.copy(alpha = 0.14f),
-                            shape = RoundedCornerShape(12.dp),
-                            border = BorderStroke(1.dp, CoralRed.copy(alpha = 0.5f))
-                        ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(12.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(Icons.Default.ErrorOutline, contentDescription = null, tint = CoralRed)
-                                Spacer(Modifier.width(8.dp))
-                                Text(exportState.message, color = CoralRed, fontSize = 12.sp)
+                is ExportProgressState.Completed -> CompletedExport(
+                    state = exportState,
+                    onShare = {
+                        onShare(exportState.outputFilePath, exportState.audioOnly, exportState.isPhotoFrame)
+                            ?.let { intent ->
+                                context.startActivity(Intent.createChooser(intent, "Share export"))
                             }
-                        }
+                    },
+                    onDone = {
+                        onReset()
+                        onDismiss()
                     }
+                )
 
-                    // 3 Clean Export Format Mode Cards (Video MP4 / Photo JPG / Audio M4A)
-                    Text("Export Format", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        ExportFormatCard(
-                            icon = Icons.Default.Movie,
-                            title = "Video",
-                            subtitle = ".MP4",
-                            selected = !cfg.audioOnly && !cfg.exportAsPhotoFrame,
-                            modifier = Modifier.weight(1f),
-                            onClick = {
-                                onUpdateConfig(cfg.copy(audioOnly = false, exportAsPhotoFrame = false))
-                            }
-                        )
-                        ExportFormatCard(
-                            icon = Icons.Default.Image,
-                            title = "Photo",
-                            subtitle = ".JPG Frame",
-                            selected = cfg.exportAsPhotoFrame,
-                            modifier = Modifier.weight(1f),
-                            onClick = {
-                                onUpdateConfig(cfg.copy(audioOnly = false, exportAsPhotoFrame = true))
-                            }
-                        )
-                        ExportFormatCard(
-                            icon = Icons.Default.Audiotrack,
-                            title = "Audio",
-                            subtitle = ".M4A AAC",
-                            selected = cfg.audioOnly,
-                            modifier = Modifier.weight(1f),
-                            onClick = {
-                                onUpdateConfig(cfg.copy(audioOnly = true, exportAsPhotoFrame = false))
-                            }
-                        )
-                    }
+                is ExportProgressState.Error -> ErrorExport(exportState.message, onReset)
 
-                    if (!cfg.audioOnly) {
-                        // Resolution (480p, 720p, 1080p, 2K, 4K)
-                        Text("Resolution", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                        Row(
-                            modifier = Modifier.horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ExportProgressState.Cancelled -> ErrorExport("Export cancelled.", onReset)
+
+                ExportProgressState.Idle -> {
+                    StudioCard(title = "Resolution") {
+                        androidx.compose.foundation.layout.FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             ExportResolution.entries.forEach { res ->
-                                FilterChip(
-                                    selected = cfg.resolution == res,
-                                    onClick = { onUpdateConfig(cfg.copy(resolution = res)) },
-                                    label = { Text(res.label) }
-                                )
+                                StudioChip(res.badge, cfg.resolution == res) {
+                                    onConfigChange(cfg.copy(resolution = res))
+                                }
+                            }
+                        }
+                        val dims = project.aspectRatio.computeDimensionsFor(
+                            cfg.resolution.shortSidePx, project.customAspectRatio
+                        )
+                        Text(
+                            "Output: ${dims.first}x${dims.second} (codec-aligned)",
+                            fontSize = 10.sp,
+                            color = TextTertiary
+                        )
+                        if (cfg.resolution == ExportResolution.UHD_4K) {
+                            val source = project.mainVideoClips.firstOrNull()
+                            val srcH = source?.sourceHeight ?: 0
+                            Text(
+                                if (srcH in 1 until 2160) {
+                                    "Heads up: your source is ${srcH}p. A 4K file gives you 4K container/bitrate, " +
+                                        "but the detail is upscaled — enable the 4K enhancer for the best result."
+                                } else {
+                                    "Source is already ${srcH}p or higher — 4K export preserves native detail."
+                                },
+                                fontSize = 10.sp,
+                                color = ZeroAmber
+                            )
+                        }
+                    }
+
+                    StudioCard(title = "Frame rate") {
+                        androidx.compose.foundation.layout.FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            ExportFrameRate.entries.forEach { fps ->
+                                StudioChip(fps.label, cfg.frameRate == fps) {
+                                    onConfigChange(cfg.copy(frameRate = fps))
+                                }
                             }
                         }
                     }
 
-                    if (!cfg.audioOnly && !cfg.exportAsPhotoFrame) {
-                        // Frame Rate (24, 25, 30, 50, 60 FPS)
-                        Text("Frame Rate", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                        Row(
-                            modifier = Modifier.horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            ExportFrameRate.entries.forEach { fr ->
-                                FilterChip(
-                                    selected = cfg.frameRate == fr,
-                                    onClick = { onUpdateConfig(cfg.copy(frameRate = fr)) },
-                                    label = { Text("${fr.fps} FPS") }
-                                )
-                            }
-                        }
-
-                        // Bitrate Controls
-                        Text(
-                            "Quality & Bitrate (${String.format(Locale.US, "%.1f Mbps", bitrateMbps)})",
-                            fontWeight = FontWeight.SemiBold,
-                            fontSize = 13.sp
-                        )
-                        Row(
-                            modifier = Modifier.horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    StudioCard(title = "Bitrate", badge = String.format(Locale.US, "%.1f Mbps", bitrateMbps)) {
+                        androidx.compose.foundation.layout.FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             BitrateTier.entries.forEach { tier ->
-                                FilterChip(
-                                    selected = cfg.bitrateTier == tier,
-                                    onClick = { onUpdateConfig(cfg.copy(bitrateTier = tier)) },
-                                    label = { Text(tier.label) }
-                                )
+                                StudioChip(tier.label, cfg.bitrateTier == tier) {
+                                    onConfigChange(cfg.copy(bitrateTier = tier))
+                                }
                             }
                         }
-
                         if (cfg.bitrateTier == BitrateTier.CUSTOM) {
-                            Slider(
+                            StudioSlider(
+                                label = "Custom bitrate",
                                 value = cfg.customBitrateMbps,
-                                onValueChange = { mbps -> onUpdateConfig(cfg.copy(customBitrateMbps = mbps)) },
-                                valueRange = 2f..80f
+                                valueRange = 1f..80f,
+                                defaultValue = 16f,
+                                valueText = String.format(Locale.US, "%.0f Mbps", cfg.customBitrateMbps)
+                            ) { onConfigChange(cfg.copy(customBitrateMbps = it)) }
+                        }
+                    }
+
+                    StudioCard(title = "Codec") {
+                        androidx.compose.foundation.layout.FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            StudioChip("H.264 (compatible)", cfg.codec == VideoCodecOption.H264) {
+                                onConfigChange(cfg.copy(codec = VideoCodecOption.H264))
+                            }
+                            StudioChip(
+                                if (isHevcSupported) "H.265 / HEVC" else "H.265 (unsupported)",
+                                cfg.codec == VideoCodecOption.H265
+                            ) {
+                                if (!isHevcSupported) codecUnavailable = true
+                                else onConfigChange(cfg.copy(codec = VideoCodecOption.H265))
+                            }
+                        }
+                        if (codecUnavailable) {
+                            Text(
+                                "This device has no H.265 hardware encoder; H.264 will be used.",
+                                fontSize = 10.sp,
+                                color = ZeroCoral
                             )
                         }
-
-                        // Hardware Video Codec
-                        Text("Video Codec", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            FilterChip(
-                                selected = cfg.codec == VideoCodecOption.H264,
-                                onClick = { onUpdateConfig(cfg.copy(codec = VideoCodecOption.H264)) },
-                                label = { Text("H.264 (Universal)") }
+                        if (encoders.isNotEmpty()) {
+                            Text(
+                                "Encoders: ${encoders.take(2).joinToString()}",
+                                fontSize = 9.sp,
+                                color = TextTertiary,
+                                maxLines = 2
                             )
-                            FilterChip(
-                                selected = cfg.codec == VideoCodecOption.H265,
-                                enabled = isHevcSupported,
-                                onClick = { onUpdateConfig(cfg.copy(codec = VideoCodecOption.H265)) },
-                                label = {
-                                    Text(if (isHevcSupported) "H.265 (HEVC)" else "H.265 (N/A)")
+                        }
+                    }
+
+                    StudioCard(title = "Audio") {
+                        StudioToggleRow("Include audio track", !cfg.audioOnly) { include ->
+                            onConfigChange(cfg.copy(audioOnly = !include))
+                        }
+                        androidx.compose.foundation.layout.FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf(128, 192, 256, 320).forEach { kbps ->
+                                StudioChip("$kbps kbps", cfg.audioBitrateKbps == kbps) {
+                                    onConfigChange(cfg.copy(audioBitrateKbps = kbps))
                                 }
-                            )
+                            }
+                        }
+                        StudioToggleRow("Save to gallery", cfg.saveToGallery) { save ->
+                            onConfigChange(cfg.copy(saveToGallery = save))
                         }
                     }
 
-                    // Save to Gallery Toggle
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Save Automatically to Device Gallery", fontSize = 13.sp)
-                        Switch(
-                            checked = cfg.saveToGallery,
-                            onCheckedChange = { onUpdateConfig(cfg.copy(saveToGallery = it)) }
-                        )
-                    }
-
-                    val (outW, outH) = project.aspectRatio.computeCodecSafeDimensions(cfg.resolution.shortSidePx)
-                    Text(
-                        text = when {
-                            cfg.audioOnly -> String.format(Locale.US, "AAC 192kbps Audio • Est. Size: %.1f MB", estimatedMb)
-                            cfg.exportAsPhotoFrame -> "Graded Still Frame (${outW}×${outH} JPEG) at current playhead"
-                            else -> String.format(Locale.US, "Output: %d×%d MP4 • Est. Size: %.1f MB", outW, outH, estimatedMb)
-                        },
-                        fontSize = 12.sp,
-                        color = ElectricCyan
-                    )
-
-                    Button(
-                        onClick = onStartExport,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(50.dp),
-                        shape = RoundedCornerShape(14.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = ElectricCyan,
-                            contentColor = Color(0xFF001F24)
-                        )
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(ZeroSurface)
+                            .padding(12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        val ctaText = when {
-                            cfg.exportAsPhotoFrame -> "SAVE GRADED PHOTO (.JPG)"
-                            cfg.audioOnly -> "EXPORT AUDIO MASTER (.M4A)"
-                            else -> "EXPORT ${cfg.resolution.badge} VIDEO (.MP4)"
-                        }
-                        Text(ctaText, fontWeight = FontWeight.ExtraBold, fontSize = 14.sp)
+                        Text("Estimated file size", fontSize = 11.sp, color = TextSecondary)
+                        Text(
+                            String.format(Locale.US, "%.1f MB", estimatedMb),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = ZeroAccent
+                        )
                     }
 
-                    Spacer(Modifier.height(16.dp))
+                    StudioPrimaryButton(
+                        text = if (cfg.audioOnly) "Export audio (.m4a)" else "Export video",
+                        icon = Icons.Default.Movie,
+                        enabled = project.totalDurationMs > 0,
+                        onClick = onStart
+                    )
+
+                    StudioPrimaryButton(
+                        text = "Save current frame as photo",
+                        icon = Icons.Default.PhotoCamera,
+                        container = ZeroSurfaceHigh,
+                        contentColor = TextPrimary,
+                        enabled = project.mainVideoClips.isNotEmpty(),
+                        onClick = {
+                            onConfigChange(cfg.copy(exportAsPhotoFrame = true))
+                            onStart()
+                        }
+                    )
                 }
             }
         }
@@ -326,38 +264,73 @@ fun ExportStudioSheet(
 }
 
 @Composable
-private fun ExportFormatCard(
-    icon: ImageVector,
-    title: String,
-    subtitle: String,
-    selected: Boolean,
-    modifier: Modifier = Modifier,
-    onClick: () -> Unit
-) {
-    Surface(
-        color = if (selected) ElectricCyan.copy(alpha = 0.18f) else SurfaceElevated,
-        shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(if (selected) 2.dp else 1.dp, if (selected) ElectricCyan else SurfaceStroke),
-        modifier = modifier.clickable(onClick = onClick)
+private fun RunningExport(state: ExportProgressState.Running, onCancel: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 18.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Column(
-            modifier = Modifier.padding(vertical = 10.dp, horizontal = 8.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(3.dp)
-        ) {
-            Icon(
-                icon,
-                contentDescription = title,
-                tint = if (selected) ElectricCyan else TextSecondary,
-                modifier = Modifier.size(20.dp)
-            )
-            Text(
-                text = title,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
-                color = if (selected) ElectricCyan else TextPrimary
-            )
-            Text(subtitle, fontSize = 10.sp, color = TextSecondary)
+        CircularProgressIndicator(
+            progress = { state.percent / 100f },
+            modifier = Modifier.size(74.dp),
+            color = ZeroAccent,
+            trackColor = ZeroStroke,
+            strokeWidth = 5.dp
+        )
+        Text("${state.percent}%", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
+        Text(state.statusLabel, fontSize = 11.sp, color = TextSecondary, textAlign = TextAlign.Center)
+        Text(
+            "Rendering with the same GPU pipeline as the preview.",
+            fontSize = 10.sp,
+            color = TextTertiary,
+            textAlign = TextAlign.Center
+        )
+        OutlinedButton(onClick = onCancel) { Text("Cancel export", color = ZeroCoral) }
+    }
+}
+
+@Composable
+private fun CompletedExport(state: ExportProgressState.Completed, onShare: () -> Unit, onDone: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Icon(Icons.Default.CheckCircle, contentDescription = null, tint = ZeroAccent, modifier = Modifier.size(52.dp))
+        Text(
+            when {
+                state.isPhotoFrame -> "Photo saved"
+                state.audioOnly -> "Audio exported"
+                else -> "Video exported"
+            },
+            style = MaterialTheme.typography.titleLarge,
+            color = TextPrimary
+        )
+        Text(
+            String.format(Locale.US, "%.2f MB", state.fileSizeBytes / (1024f * 1024f)) +
+                if (state.galleryUri != null) " • saved to gallery" else " • saved in app storage",
+            fontSize = 11.sp,
+            color = TextSecondary
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = onShare,
+                colors = ButtonDefaults.buttonColors(containerColor = ZeroAccent, contentColor = ZeroBlack)
+            ) { Text("Share") }
+            OutlinedButton(onClick = onDone) { Text("Done") }
         }
+    }
+}
+
+@Composable
+private fun ErrorExport(message: String, onReset: () -> Unit) {
+    StudioCard(title = "Export failed") {
+        Text(message, fontSize = 11.sp, color = ZeroCoral)
+        StudioPrimaryButton(
+            text = "Try again",
+            container = ZeroSurfaceHigh,
+            contentColor = TextPrimary,
+            onClick = onReset
+        )
     }
 }

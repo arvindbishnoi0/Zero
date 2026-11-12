@@ -12,8 +12,6 @@ import com.vibecut.pro.data.repository.ProjectSummary
 import com.vibecut.pro.engine.model.AspectRatioPreset
 import com.vibecut.pro.engine.model.MediaKind
 import com.vibecut.pro.engine.model.TrackType
-import com.vibecut.pro.engine.templates.ProjectTemplate
-import com.vibecut.pro.engine.templates.TemplateCatalog
 import com.vibecut.pro.engine.timeline.ImportedMediaSource
 import com.vibecut.pro.engine.timeline.TimelineEngine
 import com.vibecut.pro.media.export.VibeCutExportEngine
@@ -25,17 +23,6 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import javax.inject.Inject
-
-data class DeviceGalleryItem(
-    val uri: String,
-    val displayName: String,
-    val durationMs: Long,
-    val mediaKind: MediaKind,
-    val width: Int = 0,
-    val height: Int = 0,
-    val sizeBytes: Long = 0L,
-    val mimeType: String? = null
-)
 
 @HiltViewModel
 class HomeViewModel @Inject constructor(
@@ -49,9 +36,6 @@ class HomeViewModel @Inject constructor(
 
     val projects: StateFlow<List<ProjectSummary>> = projectRepository.projectSummariesFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-
-    val templates: StateFlow<List<ProjectTemplate>> = projectRepository.allTemplatesFlow
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), TemplateCatalog.builtInTemplates)
 
     val preferences: StateFlow<StudioPreferences> = preferencesRepository.preferencesFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), StudioPreferences())
@@ -195,42 +179,6 @@ class HomeViewModel @Inject constructor(
         }
     }
 
-    fun applyMarketplaceTemplate(
-        template: ProjectTemplate,
-        selectedUris: List<Uri>,
-        headline: String,
-        subtitle: String,
-        musicUri: Uri?,
-        onCreated: (String) -> Unit
-    ) {
-        viewModelScope.launch {
-            _isBusy.value = true
-            try {
-                val sources = if (selectedUris.isNotEmpty()) {
-                    mediaSupportManager.importMediaBatch(selectedUris).imported
-                        .filter { it.mediaKind != MediaKind.AUDIO }
-                        .ifEmpty { demoClipGenerator.generateSampleVideoClips() }
-                } else {
-                    demoClipGenerator.generateSampleVideoClips()
-                }
-                val musicSource = musicUri?.let {
-                    mediaSupportManager.importSingleUri(it, forceAudio = true).getOrNull()
-                }
-                val project = TemplateCatalog.applyTemplate(
-                    template = template,
-                    sources = sources,
-                    customHeadline = headline,
-                    customSubtitle = subtitle,
-                    musicSource = musicSource
-                )
-                projectRepository.saveProject(project, "Applied template '${template.name}'")
-                onCreated(project.id)
-            } finally {
-                _isBusy.value = false
-            }
-        }
-    }
-
     fun renameProject(projectId: String, newTitle: String) {
         viewModelScope.launch {
             projectRepository.renameProject(projectId, newTitle)
@@ -247,12 +195,6 @@ class HomeViewModel @Inject constructor(
     fun deleteProject(projectId: String) {
         viewModelScope.launch {
             projectRepository.deleteProject(projectId)
-        }
-    }
-
-    fun deleteSavedTemplate(templateId: String) {
-        viewModelScope.launch {
-            projectRepository.deleteCustomTemplate(templateId)
         }
     }
 
@@ -294,13 +236,6 @@ class HomeViewModel @Inject constructor(
 
     fun updateDefaultExport(resName: String, fpsName: String) {
         viewModelScope.launch { preferencesRepository.setDefaultExport(resName, fpsName) }
-    }
-
-    fun updateExternalAiSettings(endpoint: String, apiKey: String) {
-        viewModelScope.launch {
-            preferencesRepository.setExternalAiConfig(endpoint, apiKey)
-            _statusBanner.value = "Saved AI Integration settings"
-        }
     }
 
     fun refreshCacheSize() {

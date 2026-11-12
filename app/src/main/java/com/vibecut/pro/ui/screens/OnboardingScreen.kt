@@ -7,7 +7,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.MovieFilter
 import androidx.compose.material.icons.filled.Tune
@@ -23,6 +23,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.vibecut.pro.engine.model.EffectType
 import com.vibecut.pro.ui.theme.*
 
 private data class OnboardingPage(
@@ -39,33 +40,33 @@ fun OnboardingScreen(onFinish: () -> Unit) {
         listOf(
             OnboardingPage(
                 icon = Icons.Default.MovieFilter,
-                badge = "MULTI-TRACK ENGINE",
-                title = "Precision VN-Style Timeline",
-                description = "Magnetic multi-layer editing with frame-accurate split, speed curves, freeze frames, keyframes & 100-step undo/redo.",
-                accent = ElectricCyan
+                badge = "MULTI-TRACK TIMELINE",
+                title = "Frame-accurate editing",
+                description = "Drag the playhead, pinch to zoom, trim with handles, split at the frame, stack overlay, text and audio tracks with 100-step undo.",
+                accent = ZeroAccent
             ),
             OnboardingPage(
                 icon = Icons.Default.Tune,
-                badge = "OPENGL ES 2.0 SHADERS",
-                title = "Pro Sharpen, 22 FX & 3D LUTs",
-                description = "Stack real GPU effects—Unsharp-Mask Sharpen, Neon Glow, VHS, Glitch—plus 8-band HSL, RGB Curves & .cube 3D LUT color grading.",
-                accent = NeonViolet
+                badge = "${EffectType.entries.size} GPU EFFECTS",
+                title = "Real OpenGL effects",
+                description = "Blur, glitch, VHS, glow, sharpen, grain and more — stacked live on the GPU, with colour grading, HSL, curves and .cube 3D LUTs.",
+                accent = ZeroViolet
             ),
             OnboardingPage(
-                icon = Icons.Default.AutoAwesome,
-                badge = "LOCAL ON-DEVICE AI",
-                title = "AI Vision, Beat Sync & Hindi/EN Captions",
-                description = "ML Kit Face & Subject Tracking, Auto-Reframe, Scene Detection, PCM Beat Sync & Speech-to-Text captions—100% local, zero login required.",
-                accent = KeyframeGold
+                icon = Icons.Default.Speed,
+                badge = "SPEED, MOTION & AUDIO",
+                title = "Keyframes and beat sync",
+                description = "Velocity ramps, freeze frames, keyframed motion, voiceover, generated SFX and beat-synced cuts — all mixed by a real DSP chain.",
+                accent = ZeroAmber
             ),
             OnboardingPage(
                 icon = Icons.Default.HighQuality,
-                badge = "MEDIACODEC HARDWARE EXPORT",
-                title = "Up to 4K 60fps H.264 / HEVC",
-                description = "Hardware-accelerated Media3 Transformer export with custom Mbps bitrate control, audio-only mastering & direct gallery save.",
-                accent = EmeraldBeat
+                badge = "HARDWARE EXPORT",
+                title = "Up to 4K H.264 / HEVC",
+                description = "MediaCodec export with custom bitrate, audio mastering, gallery save and the same GPU pipeline as the preview.",
+                accent = ZeroBlue
             )
-        )
+                )
     }
 
     var pageIndex by remember { mutableIntStateOf(0) }
@@ -76,7 +77,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    listOf(ObsidianBg, Color(0xFF101524), ObsidianBg)
+                    listOf(ZeroBlack, ZeroBackground, ZeroBlack)
                 )
             )
             .systemBarsPadding()
@@ -159,7 +160,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                             .height(8.dp)
                             .width(if (idx == pageIndex) 28.dp else 8.dp)
                             .clip(CircleShape)
-                            .background(if (idx == pageIndex) p.accent else SurfaceStroke)
+                            .background(if (idx == pageIndex) p.accent else ZeroStroke)
                     )
                 }
             }
@@ -175,12 +176,12 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                 .align(Alignment.BottomCenter),
             shape = RoundedCornerShape(16.dp),
             colors = ButtonDefaults.buttonColors(
-                containerColor = ElectricCyan,
-                contentColor = Color(0xFF001F24)
+                containerColor = ZeroAccent,
+                contentColor = ZeroBlack
             )
         ) {
             Text(
-                text = if (pageIndex < pages.lastIndex) "Continue" else "Enter VibeCut Studio",
+                text = if (pageIndex < pages.lastIndex) "Continue" else "Enter ZERO",
                 fontWeight = FontWeight.Bold,
                 fontSize = 15.sp
             )

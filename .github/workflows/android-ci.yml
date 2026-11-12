@@ -1,17 +1,26 @@
-name: VibeCut Pro Android Build & Tests
+name: ZERO Android Build, Tests & Release APK
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - "main"
+      - "arena/**"
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
 
+concurrency:
+  group: zero-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-apk:
+  test-and-build:
+    name: Test • Debug • Signed Release
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
@@ -20,24 +29,119 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Gradle
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Run Unit Tests & Assemble Debug APK
+      - name: Create release keystore
+        run: |
+          mkdir -p "$RUNNER_TEMP/keystore"
+          keytool -genkeypair -v \
+            -keystore "$RUNNER_TEMP/keystore/zero-release.jks" \
+            -storepass zerorelease2024 \
+            -keypass zerorelease2024 \
+            -alias zerokey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=ZERO, OU=Studio, O=ZERO, L=Jodhpur, S=Rajasthan, C=IN"
+
+      - name: Show toolchain versions
+        run: |
+          java -version
+          ./gradlew --version
+
+      - name: Unit tests (core engine)
         run: |
           set +e
-          ./gradlew :core:engine:test testDebugUnitTest assembleDebug --stacktrace > /tmp/gradle-build.log 2>&1
+          ./gradlew :core:engine:test --stacktrace --no-daemon > /tmp/gradle-test.log 2>&1
           STATUS=$?
-          cat /tmp/gradle-build.log
+          cat /tmp/gradle-test.log
           if [ $STATUS -ne 0 ]; then
-            grep -E "^e: |FAILURE:|What went wrong:|^\* |^  > |error: |Execution failed" /tmp/gradle-build.log | head -n 40 | while IFS= read -r line; do
+            grep -E "^e: |FAILED|FAILURE:|What went wrong:|^\* |^  > |error: |Execution failed" /tmp/gradle-test.log | head -n 60 | while IFS= read -r line; do
               echo "::error::$line"
             done
             exit $STATUS
           fi
 
-      - name: Upload VibeCut Pro Debug APK
+      - name: Assemble debug APK
+        run: |
+          set +e
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon > /tmp/gradle-debug.log 2>&1
+          STATUS=$?
+          cat /tmp/gradle-debug.log
+          if [ $STATUS -ne 0 ]; then
+            grep -E "^e: |FAILURE:|What went wrong:|^\* |^  > |error: |Execution failed" /tmp/gradle-debug.log | head -n 80 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit $STATUS
+          fi
+
+      - name: Assemble signed release APK
+        env:
+          ZERO_KEYSTORE_PATH: ${{ runner.temp }}/keystore/zero-release.jks
+          ZERO_KEYSTORE_PASSWORD: zerorelease2024
+          ZERO_KEY_ALIAS: zerokey
+          ZERO_KEY_PASSWORD: zerorelease2024
+        run: |
+          set +e
+          ./gradlew :app:assembleRelease --stacktrace --no-daemon > /tmp/gradle-release.log 2>&1
+          STATUS=$?
+          cat /tmp/gradle-release.log
+          if [ $STATUS -ne 0 ]; then
+            grep -E "^e: |FAILURE:|What went wrong:|^\* |^  > |error: |Execution failed" /tmp/gradle-release.log | head -n 80 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit $STATUS
+          fi
+
+      - name: Verify APK is signed and contains latest code
+        run: |
+          set -e
+          RELEASE_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          echo "Release APK: $RELEASE_APK"
+          ls -lh app/build/outputs/apk/**/*.apk || true
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+          "$APKSIGNER" verify --print-certs "$RELEASE_APK"
+          unzip -l "$RELEASE_APK" | head -n 20
+
+      - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: VibeCutPro-debug-apk
+          name: ZERO-debug-apk
           path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+
+      - name: Upload signed release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZERO-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload unit test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZERO-unit-test-report
+          path: core/engine/build/reports/tests/test/**
+          if-no-files-found: warn
+
+      - name: Publish release asset
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          RELEASE_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          TAG="zero-latest"
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete-asset "$TAG" "ZERO-release.apk" --yes || true
+            gh release upload "$TAG" "$RELEASE_APK#ZERO-release.apk" --clobber
+          else
+            gh release create "$TAG" "$RELEASE_APK#ZERO-release.apk" \
+              --title "ZERO — latest build" \
+              --notes "Automated build from ${GITHUB_REF_NAME} @ ${SHORT_SHA}. Signed release APK." \
+              --prerelease
+          fi
