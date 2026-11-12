@@ -631,10 +631,10 @@ class VibeCutEngineTest {
         assertEquals(1080, lh)
         assertTrue("landscape width ~1920, got $lw", abs(lw - 1920) <= 16)
 
-        // A custom 4:5 ratio is honoured, and every output is macroblock aligned.
+        // A custom ratio is honoured: for ratio <= 1 the short side is the width.
         val (cw, ch) = AspectRatioPreset.CUSTOM.computeDimensionsFor(1080, 0.8f)
-        assertEquals(1080, ch)
-        assertTrue("4:5 custom width ~1350, got $cw", abs(cw - 1350) <= 16)
+        assertEquals(1080, cw)
+        assertTrue("custom 0.8 height ~1350, got $ch", abs(ch - 1350) <= 16)
         listOf(
             AspectRatioPreset.REELS_9_16,
             AspectRatioPreset.YOUTUBE_16_9,
