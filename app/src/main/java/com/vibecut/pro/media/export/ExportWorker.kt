@@ -15,9 +15,14 @@ import com.vibecut.pro.data.local.VibeCutDatabase
 import com.vibecut.pro.engine.serialization.ProjectJsonCodec
 
 /**
- * WorkManager background worker allowing long 2K/4K renders to continue reliably in the background.
- * Safely guards `FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING` for Android 15 (API 35+) to avoid
- * `IllegalArgumentException` / `MissingForegroundServiceTypeException` crashes on Android 10–14.
+ * Background export worker for long 2K/4K renders.
+ *
+ * It loads the saved project JSON, runs the exact same [VibeCutExportEngine] the editor uses and
+ * reports a foreground notification while Media3 encodes. Wrapped in `runCatching` so an encoder
+ * failure on one device can never crash the app: the worker simply reports `failure`.
+ *
+ * Note: this is currently an optional path (the editor exports inline so the user sees live
+ * progress). It is registered so background rendering is available without a second code path.
  */
 class ExportWorker(
     appContext: Context,
@@ -26,18 +31,18 @@ class ExportWorker(
 
     override suspend fun doWork(): Result {
         val projectId = inputData.getString(KEY_PROJECT_ID) ?: return Result.failure()
-        runCatching {
-            setForeground(createForegroundInfo("Rendering VibeCut Pro Media..."))
-        }
+        runCatching { setForeground(createForegroundInfo("Rendering your video…")) }
 
         val db = Room.databaseBuilder(
             applicationContext,
             VibeCutDatabase::class.java,
-            "vibecut_pro_studio.db"
-        ).build()
+            DATABASE_NAME
+        ).fallbackToDestructiveMigration().build()
 
         val entity = try {
             db.vibeCutDao().getProjectById(projectId)
+        } catch (t: Throwable) {
+            null
         } finally {
             db.close()
         }
@@ -49,43 +54,55 @@ class ExportWorker(
         val engine = VibeCutExportEngine(applicationContext)
         return when (val outcome = engine.exportProject(project, project.exportConfig)) {
             is ExportProgressState.Completed -> Result.success(
-                workDataOf(KEY_OUTPUT_PATH to outcome.outputFilePath)
+                workDataOf(
+                    KEY_OUTPUT_PATH to outcome.outputFilePath,
+                    KEY_FILE_SIZE to outcome.fileSizeBytes
+                )
             )
-            else -> Result.failure()
+            is ExportProgressState.Cancelled -> Result.failure(
+                workDataOf(KEY_ERROR to "Export cancelled")
+            )
+            is ExportProgressState.Error -> Result.failure(workDataOf(KEY_ERROR to outcome.message))
+            else -> Result.failure(workDataOf(KEY_ERROR to "Export did not finish"))
         }
     }
 
     private fun createForegroundInfo(progressText: String): ForegroundInfo {
-        val channelId = "vibecut_export_channel"
         val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                channelId,
-                "VibeCut Video Export",
-                NotificationManager.IMPORTANCE_LOW
+            nm.createNotificationChannel(
+                NotificationChannel(
+                    CHANNEL_ID,
+                    "Video export",
+                    NotificationManager.IMPORTANCE_LOW
+                )
             )
-            nm.createNotificationChannel(channel)
         }
-        val notification = NotificationCompat.Builder(applicationContext, channelId)
+        val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setContentTitle("VibeCut Pro Export")
+            .setContentTitle("ZERO export")
             .setContentText(progressText)
             .setOngoing(true)
             .build()
 
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
             ForegroundInfo(
-                1042,
+                NOTIFICATION_ID,
                 notification,
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
             )
         } else {
-            ForegroundInfo(1042, notification)
+            ForegroundInfo(NOTIFICATION_ID, notification)
         }
     }
 
     companion object {
         const val KEY_PROJECT_ID = "project_id"
         const val KEY_OUTPUT_PATH = "output_path"
+        const val KEY_FILE_SIZE = "file_size"
+        const val KEY_ERROR = "error"
+        private const val CHANNEL_ID = "vibecut_export_channel"
+        private const val NOTIFICATION_ID = 1042
+        private const val DATABASE_NAME = "vibecut_pro_studio.db"
     }
 }

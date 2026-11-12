@@ -16,6 +16,10 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 
+/**
+ * Instrumented smoke tests: the app must render on a compact phone and on a tablet without
+ * clipped or unreachable controls, and the onboarding flow must actually complete.
+ */
 @RunWith(AndroidJUnit4::class)
 class VibeCutUiInstrumentedTest {
 
@@ -35,8 +39,26 @@ class VibeCutUiInstrumentedTest {
 
         composeTestRule.onNodeWithText("Precision VN-Style Timeline").assertIsDisplayed()
         composeTestRule.onNodeWithText("Continue").performClick()
-        composeTestRule.onNodeWithText("Pro Sharpen, 22 FX & 3D LUTs").assertIsDisplayed()
-        composeTestRule.onNodeWithText("Skip").performClick()
+        composeTestRule.onNodeWithText("OpenGL ES 2.0 SHADERS").assertIsDisplayed()
+        composeTestRule.onNodeWithText("Continue").performClick()
+        composeTestRule.onNodeWithText("Music Sync, Captions & Audio Mixing").assertIsDisplayed()
+        composeTestRule.onNodeWithText("Open ZERO Studio").performClick()
+        assertTrue(completed)
+    }
+
+    @Test
+    fun tabletWidthKeepsThePrimaryActionOnScreen() {
+        var completed = false
+        composeTestRule.setContent {
+            VibeCutProTheme {
+                Box(modifier = Modifier.size(width = 800.dp, height = 1280.dp)) {
+                    OnboardingScreen(onFinish = { completed = true })
+                }
+            }
+        }
+        composeTestRule.onNodeWithText("Continue").assertIsDisplayed().performClick()
+        composeTestRule.onNodeWithText("Continue").assertIsDisplayed()
+        composeTestRule.onNodeWithText("Skip").assertIsDisplayed().performClick()
         assertTrue(completed)
     }
 }

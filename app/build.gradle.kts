@@ -6,6 +6,15 @@ plugins {
     alias(libs.plugins.hilt)
 }
 
+val releaseKeystorePath: String? = System.getenv("ZERO_KEYSTORE_PATH")
+val releaseKeystorePassword: String? = System.getenv("ZERO_KEYSTORE_PASSWORD")
+val releaseKeyAlias: String? = System.getenv("ZERO_KEY_ALIAS")
+val releaseKeyPassword: String? = System.getenv("ZERO_KEY_PASSWORD")
+val hasReleaseKeystore = !releaseKeystorePath.isNullOrBlank() &&
+    file(releaseKeystorePath).exists() &&
+    !releaseKeystorePassword.isNullOrBlank() &&
+    !releaseKeyAlias.isNullOrBlank()
+
 android {
     namespace = "com.vibecut.pro"
     compileSdk = 35
@@ -14,12 +23,23 @@ android {
         applicationId = "com.vibecut.pro"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 3
+        versionName = "2.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
+        }
+    }
+
+    signingConfigs {
+        if (hasReleaseKeystore) {
+            create("release") {
+                storeFile = file(releaseKeystorePath!!)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword ?: releaseKeystorePassword
+            }
         }
     }
 
@@ -31,6 +51,8 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Signed when a keystore is provided (CI); otherwise the release build stays unsigned.
+            signingConfig = if (hasReleaseKeystore) signingConfigs.getByName("release") else null
         }
         debug {
             applicationIdSuffix = ".debug"
@@ -120,10 +142,6 @@ dependencies {
     implementation(libs.kotlinx.coroutines.play.services)
     implementation(libs.coil.compose)
     implementation(libs.coil.video)
-
-    // Local On-Device ML Kit Vision Models
-    implementation(libs.mlkit.face.detection)
-    implementation(libs.mlkit.selfie.segmentation)
 
     // Unit & UI Testing
     testImplementation(libs.junit)

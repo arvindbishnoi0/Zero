@@ -7,7 +7,6 @@ import androidx.room.RoomDatabase
     entities = [
         ProjectEntity::class,
         ProjectRevisionEntity::class,
-        SavedTemplateEntity::class
     ],
     version = 1,
     exportSchema = true

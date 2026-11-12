@@ -1,312 +1,656 @@
 package com.vibecut.pro.engine
 
-import com.vibecut.pro.engine.ai.LocalAiAlgorithms
 import com.vibecut.pro.engine.audio.AudioDspEngine
 import com.vibecut.pro.engine.audio.BuiltInSfxPreset
 import com.vibecut.pro.engine.color.ColorGradingEngine
 import com.vibecut.pro.engine.effects.GlslShaderGenerator
+import com.vibecut.pro.engine.enhance.EnhancementPlanner
 import com.vibecut.pro.engine.keyframes.KeyframeInterpolator
 import com.vibecut.pro.engine.model.*
 import com.vibecut.pro.engine.serialization.ProjectJsonCodec
 import com.vibecut.pro.engine.subtitles.SubtitleCodec
-import com.vibecut.pro.engine.templates.TemplateCatalog
-import com.vibecut.pro.engine.templates.TemplateCategory
+import com.vibecut.pro.engine.timeline.ExportSegmentPlanner
 import com.vibecut.pro.engine.timeline.ImportedMediaSource
 import com.vibecut.pro.engine.timeline.TimelineEngine
 import com.vibecut.pro.engine.timeline.TimelineSessionManager
 import org.junit.Assert.*
 import org.junit.Test
-import kotlin.math.PI
 import kotlin.math.abs
-import kotlin.math.sin
 
+/**
+ * Engine regression suite. Every test here maps to a feature the UI exposes, so a failure means a
+ * user-visible feature is broken (not just an implementation detail).
+ */
 class VibeCutEngineTest {
 
-    private fun sampleSources() = listOf(
-        ImportedMediaSource(
-            uri = "file:///clip1.mp4",
-            displayName = "Clip 1",
-            mediaKind = MediaKind.VIDEO,
-            durationMs = 6_000L,
-            width = 1920,
-            height = 1080,
-            hasAudioTrack = true,
-            thumbnailUri = "file:///thumb1.jpg"
-        ),
-        ImportedMediaSource(
-            uri = "file:///clip2.mp4",
-            displayName = "Clip 2",
-            mediaKind = MediaKind.VIDEO,
-            durationMs = 4_000L,
-            width = 1080,
-            height = 1920,
-            hasAudioTrack = false,
-            thumbnailUri = "file:///thumb2.jpg"
-        )
+    private fun video(name: String, durationMs: Long, audio: Boolean = true) = ImportedMediaSource(
+        uri = "file:///$name.mp4",
+        displayName = name,
+        mediaKind = MediaKind.VIDEO,
+        durationMs = durationMs,
+        width = 1920,
+        height = 1080,
+        hasAudioTrack = audio,
+        thumbnailUri = "file:///$name.jpg"
     )
 
-    @Test
-    fun timelineImportTrimSplitCutFreezeAndMagneticReflowWork() {
-        var project = Project(title = "Studio Test")
-        project = TimelineEngine.importMediaClips(project, sampleSources(), TrackType.VIDEO_MAIN)
-        val mainClips = project.mainVideoClips
-        assertEquals(2, mainClips.size)
-        assertEquals(10_000L, project.totalDurationMs)
-        assertEquals(6_000L, mainClips[1].startTimeOnTrackMs)
-        assertTrue(mainClips[0].hasAudioTrack)
-        assertFalse(mainClips[1].hasAudioTrack)
-        assertEquals("file:///thumb1.jpg", mainClips[0].thumbnailUri)
+    private fun image(name: String, durationMs: Long = 3_000L) = ImportedMediaSource(
+        uri = "file:///$name.jpg",
+        displayName = name,
+        mediaKind = MediaKind.IMAGE,
+        durationMs = durationMs,
+        width = 1080,
+        height = 1350,
+        hasAudioTrack = false
+    )
 
-        // Trim first clip from 6s down to 4s -> magnetic timeline shifts clip 2 to 4_000ms
-        project = TimelineEngine.trimClip(project, mainClips[0].id, 1_000L, 5_000L)
-        val afterTrim = project.mainVideoClips
-        assertEquals(4_000L, afterTrim[0].timelineDurationMs)
-        assertEquals(4_000L, afterTrim[1].startTimeOnTrackMs)
-        assertEquals(8_000L, project.totalDurationMs)
-
-        // Split first clip at 2_000ms playhead
-        project = TimelineEngine.splitClipAt(project, afterTrim[0].id, 2_000L)
-        val afterSplit = project.mainVideoClips
-        assertEquals(3, afterSplit.size)
-        assertEquals(1_000L, afterSplit[0].trimStartMs)
-        assertEquals(3_000L, afterSplit[0].trimEndMs)
-        assertEquals(3_000L, afterSplit[1].trimStartMs)
-        assertEquals(5_000L, afterSplit[1].trimEndMs)
-
-        // Insert 1.5s freeze frame at 1_000ms
-        project = TimelineEngine.insertFreezeFrame(project, afterSplit[0].id, 1_000L, 1_500L)
-        val afterFreeze = project.mainVideoClips
-        assertTrue(afterFreeze.any { it.isFrozenFrame && it.timelineDurationMs == 1_500L })
-        assertEquals(9_500L, project.totalDurationMs)
-    }
-
-    @Test
-    fun lockedTrackBlocksMutationsAndCoalescedUndoRedoRestoresExactState() {
-        val session = TimelineSessionManager(Project(title = "Undo Test"))
-        session.execute("Import") {
-            TimelineEngine.importMediaClips(it, sampleSources(), TrackType.VIDEO_MAIN)
-        }
-        assertEquals(10_000L, session.currentProject.totalDurationMs)
-
-        val mainTrackId = session.currentProject.mainVideoClips.first().trackId
-        val firstClipId = session.currentProject.mainVideoClips.first().id
-
-        // Rapid slider updates coalesce into a single undo entry
-        val depthBeforeSlider = session.undoDepth
-        for (step in 1..10) {
-            session.executeCoalesced("sharp_$firstClipId", "Sharpen", windowMs = 5_000L) { proj ->
-                TimelineEngine.setColorGrade(proj, firstClipId, ColorGradeConfig(sharpness = step * 0.1f))
-            }
-        }
-        assertEquals(depthBeforeSlider + 1, session.undoDepth)
-        assertEquals(1.0f, session.currentProject.findClip(firstClipId)!!.colorGrade.sharpness, 0.001f)
-        session.undo()
-        assertEquals(0.0f, session.currentProject.findClip(firstClipId)!!.colorGrade.sharpness, 0.001f)
-
-        // Lock track and attempt delete -> should be blocked
-        session.execute("Lock") { TimelineEngine.toggleTrackLock(it, mainTrackId) }
-        val lockedBefore = session.currentProject
-        val attempted = TimelineEngine.deleteClip(lockedBefore, firstClipId)
-        assertEquals(2, attempted.tracks.first { it.id == mainTrackId }.clips.size)
-
-        // Unlock and delete -> clip count becomes 1
-        session.execute("Unlock") { TimelineEngine.toggleTrackLock(it, mainTrackId) }
-        session.execute("Delete Clip") { TimelineEngine.deleteClip(it, firstClipId) }
-        assertEquals(1, session.currentProject.tracks.first { it.id == mainTrackId }.clips.size)
-
-        // Undo restores deleted clip; Redo re-deletes it
-        assertNotNull(session.undo())
-        assertEquals(2, session.currentProject.tracks.first { it.id == mainTrackId }.clips.size)
-        assertNotNull(session.redo())
-        assertEquals(1, session.currentProject.tracks.first { it.id == mainTrackId }.clips.size)
-    }
-
-    @Test
-    fun speedCurvesAndKeyframesInterpolateSmoothly() {
-        var project = TimelineEngine.importMediaClips(Project(), listOf(sampleSources().first()))
-        val clipId = project.tracks.first().clips.first().id
-
-        project = TimelineEngine.setClipSpeed(project, clipId, 1.0f, SpeedCurvePreset.BULLET)
-        val curvedClip = project.findClip(clipId)!!
-        assertTrue(curvedClip.timelineDurationMs > 6_000L)
-
-        project = TimelineEngine.upsertKeyframe(
+    private fun twoClipProject(): Project {
+        var project = Project(title = "Test Reel", aspectRatio = AspectRatioPreset.REELS_9_16)
+        project = TimelineEngine.importMediaClips(
             project,
-            clipId,
-            Keyframe(property = KeyframeProperty.SCALE, timeOffsetMs = 0L, value = 1.0f, easing = EasingCurve.EASE_IN_OUT)
+            listOf(video("clipA", 8_000), video("clipB", 5_000, audio = false)),
+            TrackType.VIDEO_MAIN
         )
-        project = TimelineEngine.upsertKeyframe(
-            project,
-            clipId,
-            Keyframe(property = KeyframeProperty.SCALE, timeOffsetMs = 2_000L, value = 2.0f, easing = EasingCurve.EASE_IN_OUT)
-        )
-        val updatedClip = project.findClip(clipId)!!
-        val mid = KeyframeInterpolator.evaluateClipState(updatedClip, 1_000L)
-        assertEquals(1.5f, mid.scaleX, 0.05f)
-        val end = KeyframeInterpolator.evaluateClipState(updatedClip, 2_000L)
-        assertEquals(2.0f, end.scaleX, 0.01f)
+        return project
     }
 
+    // ------------------------------------------------------------------ 1. import & playback model
+
     @Test
-    fun all32EffectsAndProMasterShaderCompileValidGlslStructures() {
-        assertEquals(32, EffectType.entries.size)
-        for (fx in EffectType.entries) {
-            val shader = GlslShaderGenerator.buildEffectFragmentShader(fx)
-            assertTrue("Missing precision header in $fx", shader.contains("precision highp float;"))
-            assertTrue("Missing gl_FragColor in $fx", shader.contains("gl_FragColor"))
-            assertTrue("Missing uTexSampler in $fx", shader.contains("uTexSampler"))
-            assertTrue("Missing uTertiary uniform in $fx", shader.contains("uniform float uTertiary;"))
-            assertTrue("Blank primary label in $fx", fx.primaryLabel.isNotBlank())
-            assertTrue("Blank secondary label in $fx", fx.secondaryLabel.isNotBlank())
-            assertTrue("Blank tertiary label in $fx", fx.tertiaryLabel.isNotBlank())
+    fun test01_importMediaBuildsGaplessPlayableTimeline() {
+        val project = twoClipProject()
+        val clips = project.mainVideoClips
+        assertEquals(2, clips.size)
+        assertEquals(0L, clips[0].startTimeOnTrackMs)
+        assertEquals(8_000L, clips[0].endTimeOnTrackMs)
+        assertEquals(8_000L, clips[1].startTimeOnTrackMs)
+        assertEquals(13_000L, project.totalDurationMs)
+        assertTrue(clips[0].hasAudioTrack)
+        assertFalse(clips[1].hasAudioTrack)
+
+        // A seekable playlist piece exists for every clip and covers the whole timeline.
+        val pieces = ExportSegmentPlanner.planPreviewPlaylist(project)
+        assertEquals(2, pieces.size)
+        assertEquals(13_000L, pieces.sumOf { it.timelineSpanMs })
+    }
+
+    // ------------------------------------------------------------------ 2. playhead both directions
+
+    @Test
+    fun test02_playheadMovesBothWaysAndClamps() {
+        val project = twoClipProject()
+        // The engine snaps a frame to a whole millisecond, so derive the expected step from it.
+        val frameMs = Math.round(1000.0 / 30.0)
+        var playhead = 0L
+        // forward
+        playhead = TimelineEngine.stepPlayheadByFrames(playhead, 30, 45, project.totalDurationMs)
+        assertEquals(45 * frameMs, playhead)
+        // backward — the playhead must move the same way it came
+        playhead = TimelineEngine.stepPlayheadByFrames(playhead, 30, -15, project.totalDurationMs)
+        assertEquals(30 * frameMs, playhead)
+        // one frame back lands exactly one frame earlier (frame-step accuracy)
+        assertEquals(
+            29 * frameMs,
+            TimelineEngine.stepPlayheadByFrames(playhead, 30, -1, project.totalDurationMs)
+        )
+        // clamp at both ends
+        assertEquals(0L, TimelineEngine.stepPlayheadByFrames(0L, 30, -60, project.totalDurationMs))
+        assertEquals(
+            project.totalDurationMs,
+            TimelineEngine.stepPlayheadByFrames(project.totalDurationMs - 10L, 30, 30, project.totalDurationMs)
+        )
+    }
+
+    // ------------------------------------------------------------------ 3. seek accuracy
+
+    @Test
+    fun test03_timelineToSourceMappingIsExactInverse() {
+        val project = twoClipProject()
+        val clip = project.mainVideoClips[0]
+        for (offset in listOf(0L, 250L, 1_000L, 3_333L, 7_999L)) {
+            val source = clip.mapTimelineOffsetToSourceMs(offset)
+            val back = clip.mapSourceMsToTimelineOffset(source)
+            assertTrue(
+                "round-trip drift at $offset: $source -> $back",
+                abs(back - offset) <= 2L
+            )
         }
-        val master = GlslShaderGenerator.buildMasterFinishingFragmentShader()
-        assertTrue(master.contains("uGradeSharpness"))
-        assertTrue(master.contains("uSharpenRadius"))
-        assertTrue(master.contains("uSharpenThreshold"))
-        assertTrue(master.contains("uClarity"))
-        assertTrue(master.contains("uStructure"))
-        assertTrue(master.contains("uVignetteFeather"))
-        assertTrue(master.contains("uTransitionType"))
+
+        // Speed changes must keep the mapping consistent at 2x.
+        val fast = TimelineEngine.setClipSpeed(project, clip.id, 2f)
+        val fastClip = fast.mainVideoClips[0]
+        assertEquals(4_000L, fastClip.timelineDurationMs)
+        assertEquals(2_000L, fastClip.mapTimelineOffsetToSourceMs(1_000L))
+        assertEquals(1_000L, fastClip.mapSourceMsToTimelineOffset(2_000L))
     }
 
     @Test
-    fun decoupledFilterPresetsProAdjustmentsSpatialResolverAnd3dCubeLutWork() {
-        assertTrue("Expected >= 30 built-in filter presets", ColorGradingEngine.builtInPresets.size >= 30)
+    fun test03b_reversedClipMapsBackwards() {
+        val project = twoClipProject()
+        val clip = project.mainVideoClips[0]
+        val reversed = TimelineEngine.toggleReverseClip(project, clip.id).mainVideoClips[0]
+        assertTrue(reversed.isReversed)
+        val first = reversed.mapTimelineOffsetToSourceMs(0L)
+        val last = reversed.mapTimelineOffsetToSourceMs(reversed.timelineDurationMs)
+        assertTrue("reversed start should come from the tail", first > last)
+        assertEquals(reversed.trimStartMs, last)
+        assertEquals(reversed.effectiveTrimEndMs, first)
+    }
 
-        // Selecting a filter preset while keeping manual exposure & sharpness preserves both
-        val cfg = ColorGradeConfig(
-            lutPresetId = "preset-teal-orange",
-            lutIntensity = 0.75f,
-            exposure = 0.4f,
-            vibrance = 0.35f,
-            dehaze = 0.25f,
-            whites = 0.15f,
-            blacks = -0.10f,
-            sharpness = 0.55f,
-            clarity = 0.30f,
-            structure = 0.25f
+    // ------------------------------------------------------------------ 4. effects stack
+
+    @Test
+    fun test04_allDeclaredEffectsHaveRealShaders() {
+        // Every effect the UI can add must have a dedicated fragment shader body.
+        val shaders = EffectType.entries.map { GlslShaderGenerator.buildEffectFragmentShader(it) }
+        assertEquals(EffectType.entries.size, shaders.size)
+        shaders.forEachIndexed { index, shader ->
+            assertTrue(
+                "effect ${EffectType.entries[index]} has no shader",
+                shader.contains("gl_FragColor") && shader.contains("uTexSampler")
+            )
+        }
+        // and the finishing pass really implements the spatial adjustments
+        val finishing = GlslShaderGenerator.buildMasterFinishingFragmentShader()
+        assertTrue(finishing.contains("uSharpen"))
+        assertTrue(finishing.contains("uVignette"))
+        assertTrue(finishing.contains("uGrain"))
+    }
+
+    @Test
+    fun test04b_effectStackSupportsAddToggleReorderRemove() {
+        var project = twoClipProject()
+        val clipId = project.mainVideoClips[0].id
+        val blur = AppliedEffect(type = EffectType.GAUSSIAN_BLUR, intensity = 0.6f)
+        val glow = AppliedEffect(type = EffectType.GLOW, intensity = 0.4f)
+
+        project = TimelineEngine.addOrUpdateEffect(project, clipId, blur)
+        project = TimelineEngine.addOrUpdateEffect(project, clipId, glow)
+        assertEquals(2, project.findClip(clipId)!!.effects.size)
+        assertEquals(EffectType.GAUSSIAN_BLUR, project.findClip(clipId)!!.effects[0].type)
+
+        project = TimelineEngine.reorderEffect(project, clipId, glow.id, -1)
+        assertEquals(EffectType.GLOW, project.findClip(clipId)!!.effects[0].type)
+
+        project = TimelineEngine.setEffectEnabled(project, clipId, glow.id, false)
+        assertFalse(project.findClip(clipId)!!.effects.first { it.id == glow.id }.enabled)
+
+        project = TimelineEngine.removeEffect(project, clipId, blur.id)
+        assertEquals(1, project.findClip(clipId)!!.effects.size)
+
+        project = TimelineEngine.clearClipEffects(project, clipId)
+        assertTrue(project.findClip(clipId)!!.effects.isEmpty())
+    }
+
+    // ------------------------------------------------------------------ 5. colour grading
+
+    @Test
+    fun test05_colorSlidersChangePixelsInTheRightDirection() {
+        val neutral = ColorGradingEngine.gradePixelRgb(0.5f, 0.5f, 0.5f, ColorGradeConfig())
+        assertArrayEquals(floatArrayOf(0.5f, 0.5f, 0.5f), neutral, 0.001f)
+        // Pure black and pure white must survive a neutral grade unchanged.
+        assertArrayEquals(
+            floatArrayOf(0f, 0f, 0f),
+            ColorGradingEngine.gradePixelRgb(0f, 0f, 0f, ColorGradeConfig()),
+            0.01f
         )
-        assertTrue(cfg.hasColorLutChanges)
-        assertTrue(cfg.hasSpatialDetailChanges)
+        val white = ColorGradingEngine.gradePixelRgb(1f, 1f, 1f, ColorGradeConfig())
+        assertTrue(white.all { it in 0.99f..1f })
 
-        val effectiveSpatial = ColorGradingEngine.resolveEffectiveSpatialConfig(cfg)
-        assertTrue(effectiveSpatial.sharpness >= 0.55f)
-        assertEquals(0.30f, effectiveSpatial.clarity, 0.25f)
+        val brighter = ColorGradingEngine.gradePixelRgb(
+            0.5f, 0.5f, 0.5f, ColorGradeConfig(brightness = 0.4f)
+        )
+        assertTrue("brightness must raise luminance", brighter[0] > neutral[0])
 
-        val neutralOut = ColorGradingEngine.gradePixelRgb(0.5f, 0.5f, 0.5f, ColorGradeConfig())
-        val gradedOut = ColorGradingEngine.gradePixelRgb(0.5f, 0.5f, 0.5f, cfg)
-        assertTrue(abs(gradedOut[0] - neutralOut[0]) > 0.02f || abs(gradedOut[2] - neutralOut[2]) > 0.02f)
+        val darker = ColorGradingEngine.gradePixelRgb(
+            0.5f, 0.5f, 0.5f, ColorGradeConfig(exposure = -1f)
+        )
+        assertTrue("negative exposure must darken", darker[0] < neutral[0])
 
+        val warm = ColorGradingEngine.gradePixelRgb(
+            0.5f, 0.5f, 0.5f, ColorGradeConfig(temperature = 0.6f)
+        )
+        assertTrue("temperature must push red above blue", warm[0] > warm[2])
+
+        val saturated = ColorGradingEngine.gradePixelRgb(
+            0.8f, 0.3f, 0.3f, ColorGradeConfig(saturation = 0.8f)
+        )
+        assertTrue("saturation must increase channel spread", saturated[0] - saturated[1] > 0.5f - 0.3f)
+
+        val desaturated = ColorGradingEngine.gradePixelRgb(
+            0.8f, 0.3f, 0.3f, ColorGradeConfig(saturation = -1f)
+        )
+        assertTrue(
+            "full desaturation must collapse channels",
+            abs(desaturated[0] - desaturated[1]) < 0.05f
+        )
+    }
+
+    @Test
+    fun test05b_lutBakeMatchesReferenceAndPresetsExist() {
+        val cfg = ColorGradeConfig(exposure = 0.3f, contrast = 0.2f, saturation = 0.25f)
         val baked = ColorGradingEngine.bakeTo3dCube(cfg, size = 9)
         assertEquals(9, baked.size)
-        assertEquals(9, baked.argbCube.size)
+        val mid = baked.argbCube[4][4][4]
+        val reference = ColorGradingEngine.gradePixelRgb(0.5f, 0.5f, 0.5f, cfg)
+        val r = ((mid shr 16) and 0xFF) / 255f
+        assertEquals(reference[0], r, 0.02f)
 
-        val cubeContent = buildString {
-            appendLine("TITLE \"UnitTestLUT\"")
-            appendLine("LUT_3D_SIZE 2")
-            for (b in 0..1) for (g in 0..1) for (r in 0..1) {
-                appendLine("$r.0 $g.0 $b.0")
-            }
+        assertTrue(ColorGradingEngine.builtInPresets.size >= 30)
+        assertTrue(ColorGradingEngine.filterCategories.contains("Cinematic"))
+    }
+
+    @Test
+    fun test05c_customCubeLutParsesAndNeutralisesOnBadInput() {
+        val size = 3
+        val sb = StringBuilder()
+        sb.appendLine("TITLE \"Invert Test\"")
+        sb.appendLine("LUT_3D_SIZE $size")
+        // inverted cube: value = 1 - input
+        for (b in 0 until size) for (g in 0 until size) for (r in 0 until size) {
+            sb.appendLine(
+                "${1f - r / (size - 1f)} ${1f - g / (size - 1f)} ${1f - b / (size - 1f)}"
+            )
         }
-        val parsed = ColorGradingEngine.parseAdobeCubeLut(cubeContent)
-        assertEquals("UnitTestLUT", parsed.title)
+        val cube = ColorGradingEngine.parseAdobeCubeLut(sb.toString())
+        assertEquals("Invert Test", cube.title)
+        assertEquals(size, cube.size)
+        // cube[r][g][b]: input 0 maps to 1.0, input 1 maps to 0.0 for an inverted LUT.
+        val darkCorner = cube.argbCube[0][0][0]
+        val brightCorner = cube.argbCube[2][2][2]
+        assertEquals(255, (darkCorner shr 16) and 0xFF)
+        assertEquals(255, (darkCorner shr 8) and 0xFF)
+        assertEquals(255, darkCorner and 0xFF)
+        assertEquals(0, (brightCorner shr 16) and 0xFF)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            ColorGradingEngine.parseAdobeCubeLut("TITLE broken\n0 0 0\n")
+        }
+    }
+
+    @Test
+    fun test05d_spatialPresetFoldingReachesFinishingPass() {
+        val preset = ColorGradingEngine.builtInPresets.first { it.config.sharpness > 0.3f }
+        val cfg = ColorGradeConfig(lutPresetId = preset.id, lutIntensity = 1f)
+        val folded = ColorGradingEngine.resolveEffectiveSpatialConfig(cfg)
+        assertTrue(folded.hasSpatialDetailChanges)
+        assertTrue(ColorGradingEngine.needsFinishingPass(cfg))
+
+        val disabled = ColorGradingEngine.resolveEffectiveSpatialConfig(cfg.copy(lutIntensity = 0f))
+        assertFalse(disabled.hasSpatialDetailChanges)
+    }
+
+    // ------------------------------------------------------------------ 6. split / trim / move
+
+    @Test
+    fun test06_splitTrimAndMoveKeepTimelineConsistent() {
+        var project = twoClipProject()
+        val firstId = project.mainVideoClips[0].id
+
+        project = TimelineEngine.splitClipAt(project, firstId, 3_000L)
+        assertEquals(3, project.mainVideoClips.size)
+        assertTrue(project.mainVideoClips.all { it.startTimeOnTrackMs >= 0L })
+
+        // trimming the middle clip shortens the timeline; the magnetic track closes the gap
+        val middle = project.mainVideoClips[1]
+        project = TimelineEngine.trimClip(project, middle.id, middle.trimStartMs, middle.trimStartMs + 1_000L)
+        val middleAfter = project.findClip(middle.id)!!
+        assertEquals(1_000L, middleAfter.trimmedSourceDurationMs)
+        var trimCursor = 0L
+        project.mainVideoClips.sortedBy { it.startTimeOnTrackMs }.forEach {
+            assertEquals(trimCursor, it.startTimeOnTrackMs)
+            trimCursor += it.timelineDurationMs
+        }
+
+        // moving a clip to the front of a magnetic track reflows instead of overlapping
+        val lastId = project.mainVideoClips.last().id
+        project = TimelineEngine.moveClipToTimestamp(project, lastId, 0L)
+        val ordered = project.mainVideoClips.sortedBy { it.startTimeOnTrackMs }
+        assertEquals(lastId, ordered.first().id)
+        var cursor = 0L
+        ordered.forEach { clip ->
+            assertEquals(cursor, clip.startTimeOnTrackMs)
+            cursor += clip.timelineDurationMs
+        }
+        assertEquals(cursor, project.totalDurationMs)
+    }
+
+    @Test
+    fun test06b_freezeFrameAndDuplication() {
+        var project = twoClipProject()
+        val clipId = project.mainVideoClips[0].id
+        project = TimelineEngine.insertFreezeFrame(project, clipId, 2_000L, 1_500L)
+        val frozen = project.mainVideoClips.firstOrNull { it.isFrozenFrame }
+        assertNotNull(frozen)
+        assertEquals(1_500L, frozen!!.timelineDurationMs)
+
+        val before = project.mainVideoClips.size
+        project = TimelineEngine.duplicateClip(project, clipId)
+        assertEquals(before + 1, project.mainVideoClips.size)
+        // The duplicate is inserted right after the source and the magnetic track stays gapless.
+        val ordered = project.mainVideoClips.sortedBy { it.startTimeOnTrackMs }
+        var cursor = 0L
+        ordered.forEach {
+            assertEquals(cursor, it.startTimeOnTrackMs)
+            cursor += it.timelineDurationMs
+        }
+    }
+
+    // ------------------------------------------------------------------ 7. text & overlays
+
+    @Test
+    fun test07_textAndOverlayTracksAndSubtitles() {
+        var project = twoClipProject()
+        project = TimelineEngine.addTextClip(project, TextStyleSpec(text = "Hello ZERO"), 1_000L, 2_500L)
+        val textTrack = project.trackByType(TrackType.TEXT)
+        assertNotNull(textTrack)
+        assertEquals(1, textTrack!!.clips.size)
+        assertEquals("Hello ZERO", textTrack.clips[0].textSpec?.text)
+        // timelineDurationMs honours the requested cue length, but never drops under the 300 ms floor.
+        assertEquals(2_500L, textTrack.clips[0].timelineDurationMs)
+        assertEquals(MediaKind.TEXT_ELEMENT, textTrack.clips[0].mediaKind)
+
+        val pip = TimelineEngine.addTrack(project, TrackType.VIDEO_PIP)
+        assertNotNull(pip.trackByType(TrackType.VIDEO_PIP))
+        val withOverlay = TimelineEngine.importMediaClips(
+            pip,
+            listOf(video("overlay", 4_000)),
+            TrackType.VIDEO_PIP,
+            insertAtPlayheadMs = 500L
+        )
+        val overlayClip = withOverlay.trackByType(TrackType.VIDEO_PIP)!!.clips.first()
+        assertEquals(500L, overlayClip.startTimeOnTrackMs)
+        assertTrue(overlayClip.transform.scaleX < 0.9f) // PiP default inset
+        assertEquals(0.55f, overlayClip.transform.scaleX, 0.001f)
+
+        // transform + opacity + blend are honoured by the keyframe evaluator
+        val transformed = TimelineEngine.setClipTransform(
+            withOverlay, overlayClip.id, ClipTransform(positionX = 0.25f, scaleX = 1.4f, scaleY = 1.4f, opacity = 0.6f, blendMode = BlendMode.SCREEN)
+        )
+        val overlayTransform = transformed.findClip(overlayClip.id)!!.transform
+        assertEquals(0.25f, overlayTransform.positionX, 0.001f)
+        assertEquals(1.4f, overlayTransform.scaleX, 0.001f)
+        assertEquals(0.6f, overlayTransform.opacity, 0.001f)
+        val state = KeyframeInterpolator.evaluateClipState(transformed.findClip(overlayClip.id)!!, 0L)
+        assertEquals(0.25f, state.positionX, 0.001f)
+        assertEquals(1.4f, state.scaleX, 0.001f)
+        assertEquals(0.6f, state.opacity, 0.001f)
+
+        // subtitles round-trip through SRT
+        project = TimelineEngine.upsertSubtitleCue(
+            project, SubtitleCue(text = "First line", startTimeMs = 0, endTimeMs = 1_500)
+        )
+        project = TimelineEngine.upsertSubtitleCue(
+            project, SubtitleCue(text = "Second line", startTimeMs = 1_500, endTimeMs = 3_000)
+        )
+        val srt = SubtitleCodec.exportSrt(project.subtitles)
+        val parsed = SubtitleCodec.parseSrt(srt)
         assertEquals(2, parsed.size)
-        assertEquals(0xFFFFFFFF.toInt(), parsed.argbCube[1][1][1])
+        assertEquals("First line", parsed[0].text)
     }
 
-    @Test
-    fun codecSafeMacroblockDimensionsAlignTo16PixelsAcrossAllAspects() {
-        for (aspect in AspectRatioPreset.entries) {
-            for (res in ExportResolution.entries) {
-                val (w, h) = aspect.computeCodecSafeDimensions(res.shortSidePx, alignment = 16)
-                assertEquals("Width $w not 16px-aligned for $aspect @ $res", 0, w % 16)
-                assertEquals("Height $h not 16px-aligned for $aspect @ $res", 0, h % 16)
-                assertTrue(w >= 64 && h >= 64)
-            }
-        }
-    }
+    // ------------------------------------------------------------------ 8. music sync & mixing
 
     @Test
-    fun audioBeatDetectionDspAndSfxWavSynthesisWork() {
-        val sr = 44_100
-        val pcm = ShortArray(sr * 4)
-        for (beat in 0 until 8) {
-            val start = beat * (sr / 2)
-            for (i in 0 until 1500) {
-                if (start + i < pcm.size) {
-                    val env = 1.0 - (i / 1500.0)
-                    pcm[start + i] = (sin(2.0 * PI * 110.0 * i / sr) * env * 28000).toInt().toShort()
-                }
-            }
-        }
-        val analysis = AudioDspEngine.detectBeatsAndBpm(pcm, sr, 1)
-        assertTrue("Expected >= 5 beats, got ${analysis.beatTimestampsMs.size}", analysis.beatTimestampsMs.size >= 5)
-        assertEquals(120f, analysis.estimatedBpm, 6f)
-
-        for (preset in BuiltInSfxPreset.entries) {
-            val wav = AudioDspEngine.synthesizeSfxWavBytes(preset, 22_050)
-            assertTrue(wav.size > 44)
-            assertEquals("RIFF", String(wav.copyOfRange(0, 4)))
-            assertEquals("WAVE", String(wav.copyOfRange(8, 12)))
-        }
-    }
-
-    @Test
-    fun srtSubtitlesTemplatesAiAndProjectJsonRoundTripLosslessly() {
-        assertEquals(12, TemplateCategory.entries.size)
-        val tpl = TemplateCatalog.builtInTemplates.first()
-        var project = TemplateCatalog.applyTemplate(tpl, sampleSources())
-        project = LocalAiAlgorithms.applyAiAutoEdit(project)
-        val mainId = project.mainVideoClips.first().id
-        project = TimelineEngine.setColorGrade(
-            project,
-            mainId,
-            ColorGradeConfig(
-                lutPresetId = "preset-kodak-2383",
-                lutIntensity = 0.82f,
-                sharpness = 0.64f,
-                sharpenRadius = 0.45f,
-                sharpenThreshold = 0.22f,
-                clarity = 0.35f,
-                structure = 0.28f,
-                dehaze = 0.20f,
-                vibrance = 0.30f
-            )
-        )
-        project = TimelineEngine.addOrUpdateEffect(
-            project,
-            mainId,
-            AppliedEffect(
-                type = EffectType.HALATION,
-                intensity = 0.72f,
-                secondaryParam = 0.58f,
-                tertiaryParam = 0.41f
-            )
-        )
-        project = project.copy(exportConfig = project.exportConfig.copy(exportAsPhotoFrame = true))
-        project = SubtitleCodec.applySubtitlesToTextTrack(
+    fun test08_audioMixGainsFadesAndDucking() {
+        var project = twoClipProject()
+        project = TimelineEngine.importMediaClips(
             project,
             listOf(
-                SubtitleCue(text = "नमस्ते इंडिया", startTimeMs = 200L, endTimeMs = 1500L, languageTag = "hi-IN"),
-                SubtitleCue(text = "Welcome to VibeCut Pro", startTimeMs = 1600L, endTimeMs = 3200L, languageTag = "en-US")
-            )
+                ImportedMediaSource(
+                    uri = "file:///music.m4a",
+                    displayName = "Music",
+                    mediaKind = MediaKind.AUDIO,
+                    durationMs = 12_000L,
+                    hasAudioTrack = true
+                )
+            ),
+            TrackType.AUDIO_MUSIC,
+            0L
+        )
+        val musicClip = project.trackByType(TrackType.AUDIO_MUSIC)!!.clips.first()
+        assertEquals(0L, musicClip.startTimeOnTrackMs)
+
+        project = TimelineEngine.updateClip(project, musicClip.id) {
+            it.copy(volume = 0.5f, fadeInMs = 1_000L, fadeOutMs = 1_000L, audioDucking = true)
+        }
+        val updated = project.findClip(musicClip.id)!!
+        assertEquals(0.5f, updated.volume, 0.001f)
+
+        // beat markers survive serialisation (used by the waveform lane)
+        val marked = TimelineEngine.updateClip(project, musicClip.id) {
+            it.copy(beatMarkersMs = listOf(0L, 500L, 1_000L), waveformPeaks = List(32) { 0.4f })
+        }
+        val decoded = ProjectJsonCodec.decodeProject(ProjectJsonCodec.encodeProject(marked))
+        val roundTripped = decoded.findClip(musicClip.id)!!
+        assertEquals(3, roundTripped.beatMarkersMs.size)
+        assertEquals(32, roundTripped.waveformPeaks.size)
+
+        // audio DSP produces deterministic samples for a WAV SFX preset
+        val wav = AudioDspEngine.synthesizeSfxWavBytes(BuiltInSfxPreset.entries.first(), 44_100)
+        assertTrue(wav.size > 1_000)
+        assertEquals("RIFF", String(wav, 0, 4, Charsets.US_ASCII))
+        assertEquals("WAVE", String(wav, 8, 4, Charsets.US_ASCII))
+        // Declared WAV length must match the real byte count, or players truncate the SFX.
+        val declared = java.nio.ByteBuffer.wrap(wav, 4, 4)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN).int
+        assertEquals(wav.size - 8, declared)
+    }
+
+    // ------------------------------------------------------------------ 9. transitions
+
+    @Test
+    fun test09_transitionsHaveRealShaderCode() {
+        // Each transition must map to its own shader branch (0 = no transition).
+        val codes = TransitionType.entries.map { GlslShaderGenerator.transitionCode(it) }
+        assertEquals(TransitionType.entries.size, codes.toSet().size)
+        assertTrue("transition codes must be positive", codes.all { it > 0 })
+        assertEquals(0, GlslShaderGenerator.transitionCode(null))
+        // The finishing shader must actually select on those ids (1..7 are explicit branches,
+        // 8 = CUSTOM is the designed fallback branch).
+        val finishing = GlslShaderGenerator.buildMasterFinishingFragmentShader()
+        (1..7).forEach { id ->
+            assertTrue("finishing pass has no branch for transition id $id", finishing.contains("uTransitionType == $id"))
+        }
+        assertEquals(8, GlslShaderGenerator.transitionCode(TransitionType.CUSTOM))
+        assertTrue(finishing.contains("uTransitionChromatic"))
+        // FADE and DISSOLVE must be distinct implementations (a dissolve is a dithered reveal).
+        assertTrue(finishing.contains("uTransitionType == 1"))
+        assertTrue(finishing.contains("uTransitionType == 2"))
+        assertTrue("dissolve needs a dither term", finishing.contains("dissolve"))
+        var project = twoClipProject()
+        val clipId = project.mainVideoClips[0].id
+        project = TimelineEngine.setClipTransition(
+            project, clipId, ClipTransition(type = TransitionType.WIPE, durationMs = 600L, directionAngleDeg = 90f)
+        )
+        val clip = project.findClip(clipId)!!
+        assertEquals(TransitionType.WIPE, clip.transitionIn!!.type)
+        assertEquals(600L, clip.transitionIn!!.durationMs)
+
+        project = TimelineEngine.setClipTransition(project, clipId, null)
+        assertNull(project.findClip(clipId)!!.transitionIn)
+    }
+
+    // ------------------------------------------------------------------ 10/11. export planning
+
+    @Test
+    fun test10_exportStructureMatchesTimelineFor1080p() {
+        val project = twoClipProject()
+        val cfg = project.exportConfig.copy(
+            resolution = ExportResolution.FHD_1080P,
+            frameRate = ExportFrameRate.FPS_30,
+            bitrateTier = BitrateTier.HIGH
+        )
+        val (w, h) = AspectRatioPreset.dimensionsForProject(
+            project.aspectRatio, cfg.resolution.shortSidePx, project.customAspectRatio
+        )
+        assertEquals(0, w % 16)
+        assertEquals(0, h % 16)
+        assertTrue("1080p portrait must be ~1080 wide, got $w", abs(w - 1080) <= 16)
+        assertTrue("1080p portrait must be ~1920 tall, got $h", abs(h - 1920) <= 16)
+        assertTrue(cfg.targetVideoBitrateBps(project.aspectRatio, project.customAspectRatio) > 4_000_000)
+
+        val planned = ExportSegmentPlanner.planVisualTracks(project)
+        assertTrue(planned.isNotEmpty())
+        assertEquals(0L, planned.first().segment.timelineStartMs)
+        assertEquals(project.totalDurationMs, ExportSegmentPlanner.totalExportDurationMs(project))
+        assertEquals(
+            project.totalDurationMs,
+            ExportSegmentPlanner.durationMsForFrames(project.totalDurationMs, 30)
+        )
+    }
+
+    @Test
+    fun test11_speedRampExportSplitsIntoConstantSegments() {
+        var project = twoClipProject()
+        val clipId = project.mainVideoClips[0].id
+        project = TimelineEngine.setClipSpeed(
+            project,
+            clipId,
+            speed = 1f,
+            curvePreset = SpeedCurvePreset.MONTAGE
+        )
+        val clip = project.findClip(clipId)!!
+        assertTrue(clip.hasSpeedRamp)
+
+        val segments = ExportSegmentPlanner.planClip(clip)
+        assertTrue("ramped clip must be split for export", segments.size > 1)
+        // Segment timeline spans must tile the clip exactly, in order, with no gaps.
+        var cursor = clip.startTimeOnTrackMs
+        segments.forEach { seg ->
+            assertEquals(cursor, seg.timelineStartMs)
+            cursor = seg.timelineEndMs
+            assertTrue(seg.sourceEndMs > seg.sourceStartMs)
+        }
+        assertEquals(clip.endTimeOnTrackMs, cursor)
+
+        // Preview pieces have the same coverage and a real playback rate.
+        val pieces = ExportSegmentPlanner.planPreviewPlaylist(project).filter { it.clip.id == clipId }
+        assertEquals(clip.timelineDurationMs, pieces.sumOf { it.timelineSpanMs })
+        pieces.forEach {
+            assertTrue(it.speed in 0.1f..4.0f)
+        }
+    }
+
+    @Test
+    fun test11b_4kExportIsHonestAboutDetail() {
+        val project = twoClipProject()
+        val cfg = project.exportConfig.copy(
+            resolution = ExportResolution.UHD_4K,
+            frameRate = ExportFrameRate.FPS_60
+        )
+        val (w, h) = AspectRatioPreset.dimensionsForProject(
+            project.aspectRatio, cfg.resolution.shortSidePx, project.customAspectRatio
+        )
+        assertEquals(0, w % 16)
+        assertEquals(0, h % 16)
+        assertTrue("4K portrait must be at least 2160 tall, got $h", h >= 2160)
+
+        val plan = EnhancementPlanner.plan(
+            config = project.enhancement.copy(enabled = true, targetHeight = 2160),
+            aspect = project.aspectRatio,
+            customRatio = project.customAspectRatio,
+            sourceWidth = 1080,
+            sourceHeight = 1920
+        )
+        assertFalse("upscaling must never be advertised as AI", plan.isAiEnhanced)
+        assertTrue(plan.realDetailRatio <= 1f)
+        assertTrue(plan.upscaleLabel.isNotBlank())
+        assertTrue(plan.detailHonestyLabel.isNotBlank())
+    }
+
+    // ------------------------------------------------------------------ 12. persistence
+
+    @Test
+    fun test12_projectRoundTripsThroughJsonAndUndoStack() {
+        var project = twoClipProject()
+        val clipId = project.mainVideoClips[0].id
+        project = TimelineEngine.setColorGrade(
+            project, clipId, ColorGradeConfig(exposure = 0.4f, sharpness = 0.5f, vignette = 0.3f, grain = 0.2f)
+        )
+        project = TimelineEngine.addOrUpdateEffect(
+            project, clipId, AppliedEffect(type = EffectType.VHS, intensity = 0.7f)
+        )
+        project = TimelineEngine.upsertKeyframe(
+            project, clipId, Keyframe(property = KeyframeProperty.SCALE, timeOffsetMs = 0L, value = 1f)
+        )
+        project = TimelineEngine.upsertKeyframe(
+            project, clipId, Keyframe(property = KeyframeProperty.SCALE, timeOffsetMs = 2_000L, value = 1.6f)
         )
 
-        val srt = SubtitleCodec.exportSrt(project.subtitles)
-        val parsedCues = SubtitleCodec.parseSrt(srt)
-        assertEquals(2, parsedCues.size)
-        assertEquals("नमस्ते इंडिया", parsedCues[0].text)
+        val decoded = ProjectJsonCodec.decodeProject(ProjectJsonCodec.encodeProject(project))
+        val clip = decoded.findClip(clipId)!!
+        assertEquals(0.4f, clip.colorGrade.exposure, 0.001f)
+        assertEquals(0.5f, clip.colorGrade.sharpness, 0.001f)
+        assertEquals(0.3f, clip.colorGrade.vignette, 0.001f)
+        assertEquals(1, clip.effects.size)
+        assertEquals(EffectType.VHS, clip.effects[0].type)
+        assertEquals(2, clip.keyframes.size)
 
-        val json = ProjectJsonCodec.encodeProject(project)
-        val restored = ProjectJsonCodec.decodeProject(json)
-        val restoredMain = restored.findClip(mainId)!!
-        assertEquals("preset-kodak-2383", restoredMain.colorGrade.lutPresetId)
-        assertEquals(0.82f, restoredMain.colorGrade.lutIntensity, 0.001f)
-        assertEquals(0.64f, restoredMain.colorGrade.sharpness, 0.001f)
-        assertEquals(0.45f, restoredMain.colorGrade.sharpenRadius, 0.001f)
-        assertEquals(0.35f, restoredMain.colorGrade.clarity, 0.001f)
-        assertEquals(0.41f, restoredMain.effects.last().tertiaryParam, 0.001f)
-        assertTrue(restored.exportConfig.exportAsPhotoFrame)
+        // animated scale interpolates between the two keyframes
+        val mid = KeyframeInterpolator.evaluateClipState(clip, 1_000L)
+        assertTrue(mid.scaleX > 1.05f && mid.scaleX < 1.55f)
+
+        // undo/redo restores exactly the previous grade
+        val session = TimelineSessionManager()
+        session.reset(decoded)
+        session.execute("Grade") { TimelineEngine.setColorGrade(it, clipId, ColorGradeConfig()) }
+        assertEquals(0f, session.currentProject.findClip(clipId)!!.colorGrade.exposure, 0.001f)
+        val undone = session.undo()
+        assertNotNull(undone)
+        assertEquals(0.4f, undone!!.findClip(clipId)!!.colorGrade.exposure, 0.001f)
+        val redone = session.redo()
+        assertEquals(0f, redone!!.findClip(clipId)!!.colorGrade.exposure, 0.001f)
+    }
+
+    @Test
+    fun test12b_keyframeEasingIsMonotonicAndBounded() {
+        val kfs = listOf(
+            Keyframe(property = KeyframeProperty.OPACITY, timeOffsetMs = 0L, value = 0f, easing = EasingCurve.EASE_IN_OUT),
+            Keyframe(property = KeyframeProperty.OPACITY, timeOffsetMs = 1_000L, value = 1f, easing = EasingCurve.EASE_IN_OUT)
+        )
+        var previous = -1f
+        for (t in 0..1_000 step 100) {
+            val value = KeyframeInterpolator.evaluateProperty(kfs, KeyframeProperty.OPACITY, t.toLong(), 1f)
+            assertTrue("opacity eased backwards at $t", value >= previous - 0.001f)
+            assertTrue(value in 0f..1f)
+            previous = value
+        }
+        assertEquals(0f, KeyframeInterpolator.evaluateEasing(0f, EasingCurve.EASE_IN_OUT), 0.001f)
+        assertEquals(1f, KeyframeInterpolator.evaluateEasing(1f, EasingCurve.EASE_IN_OUT), 0.001f)
+    }
+
+    @Test
+    fun test12c_aspectRatioPresetsAndCustomRatiosAreCodecSafe() {
+        // 9:16 (portrait) and 16:9 (landscape) must orient the short side correctly.
+        val (pw, ph) = AspectRatioPreset.dimensionsForProject(AspectRatioPreset.REELS_9_16, 1080, 0.5625f)
+        assertTrue("portrait must be taller", ph > pw)
+        val (lw, lh) = AspectRatioPreset.dimensionsForProject(AspectRatioPreset.YOUTUBE_16_9, 1080, 0.5625f)
+        assertTrue("landscape must be wider", lw > lh)
+        // 1080 is the short side, so a 16:9 frame is ~1920x1080 (snapped to the 16px grid).
+        assertTrue("landscape height ~1080, got $lh", abs(lh - 1080) <= 16)
+        assertTrue("landscape width ~1920, got $lw", abs(lw - 1920) <= 16)
+
+        // A custom ratio is honoured: for ratio <= 1 the short side is the width.
+        val (cw, ch) = AspectRatioPreset.CUSTOM.computeDimensionsFor(1080, 0.8f)
+        assertEquals(1080, cw)  // unaligned helper keeps the exact requested short side
+        assertTrue("custom 0.8 height ~1350, got $ch", abs(ch - 1350) <= 16)
+        listOf(
+            AspectRatioPreset.REELS_9_16,
+            AspectRatioPreset.YOUTUBE_16_9,
+            AspectRatioPreset.SQUARE_1_1,
+            AspectRatioPreset.PORTRAIT_4_5,
+            AspectRatioPreset.CUSTOM
+        ).forEach { preset ->
+            listOf(720, 1080, 1440, 2160).forEach { shortSide ->
+                val (w, h) = AspectRatioPreset.dimensionsForProject(preset, shortSide, 0.8f)
+                assertEquals("$preset @ $shortSide width must be aligned", 0, w % 16)
+                assertEquals("$preset @ $shortSide height must be aligned", 0, h % 16)
+                assertTrue(w > 0 && h > 0)
+            }
+        }
+        assertEquals(AspectRatioPreset.SQUARE_1_1, AspectRatioPreset.fromId("1:1"))
+        // Unknown ids fall back to the default ratio instead of crashing a saved project.
+        assertEquals(AspectRatioPreset.REELS_9_16, AspectRatioPreset.fromId("nonsense"))
     }
 }

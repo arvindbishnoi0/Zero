@@ -18,7 +18,7 @@ import androidx.navigation.navArgument
 import com.vibecut.pro.ui.editor.EditorScreen
 import com.vibecut.pro.ui.screens.HomeStudioScreen
 import com.vibecut.pro.ui.screens.OnboardingScreen
-import com.vibecut.pro.ui.theme.VibeCutProTheme
+import com.vibecut.pro.ui.theme.ZeroTheme
 import com.vibecut.pro.ui.viewmodel.EditorViewModel
 import com.vibecut.pro.ui.viewmodel.HomeViewModel
 import dagger.hilt.android.AndroidEntryPoint
@@ -34,7 +34,7 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(0xFF0B0D12.toInt())
         )
         setContent {
-            VibeCutProTheme {
+            ZeroTheme {
                 VibeCutNavigationApp()
             }
         }

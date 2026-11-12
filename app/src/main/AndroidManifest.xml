@@ -13,16 +13,13 @@
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
 
-    <!-- Audio Studio Voiceover & On-Device Speech Recognition (Hindi / English) -->
+    <!-- Voiceover recording -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <!-- Background Export & Notifications -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
-
-    <!-- Optional user-configured external GenAI endpoint -->
-    <uses-permission android:name="android.permission.INTERNET" />
 
     <!-- Hardware OpenGL ES 2.0+ GPU Shader Pipeline -->
     <uses-feature

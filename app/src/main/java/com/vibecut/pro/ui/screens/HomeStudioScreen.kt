@@ -35,12 +35,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.vibecut.pro.data.repository.ProjectSummary
-import com.vibecut.pro.engine.ai.AiToolType
 import com.vibecut.pro.engine.model.AspectRatioPreset
 import com.vibecut.pro.engine.model.ExportFrameRate
 import com.vibecut.pro.engine.model.ExportResolution
-import com.vibecut.pro.engine.templates.ProjectTemplate
-import com.vibecut.pro.engine.templates.TemplateCategory
 import com.vibecut.pro.ui.theme.*
 import com.vibecut.pro.ui.viewmodel.HomeViewModel
 import java.text.SimpleDateFormat
@@ -48,9 +45,7 @@ import java.util.Date
 import java.util.Locale
 
 private enum class HomeNavSection(val label: String) {
-    STUDIO("Studio"),
-    TEMPLATES("Templates"),
-    AI_HUB("AI Hub"),
+    STUDIO("Projects"),
     SETTINGS("Settings")
 }
 
@@ -60,7 +55,6 @@ fun HomeStudioScreen(
     onOpenEditor: (String) -> Unit
 ) {
     val projects by viewModel.projects.collectAsState()
-    val templates by viewModel.templates.collectAsState()
     val prefs by viewModel.preferences.collectAsState()
     val galleryItems by viewModel.galleryItems.collectAsState()
     val importProgress by viewModel.importProgress.collectAsState()
@@ -71,7 +65,6 @@ fun HomeStudioScreen(
     var activeSection by remember { mutableStateOf(HomeNavSection.STUDIO) }
     var selectedAspect by remember { mutableStateOf(AspectRatioPreset.REELS_9_16) }
     var showNewProjectSheet by remember { mutableStateOf(false) }
-    var activeTemplateForDialog by remember { mutableStateOf<ProjectTemplate?>(null) }
     var renameTarget by remember { mutableStateOf<ProjectSummary?>(null) }
     var historyTargetId by remember { mutableStateOf<String?>(null) }
 
@@ -98,7 +91,7 @@ fun HomeStudioScreen(
     }
 
     Scaffold(
-        containerColor = ObsidianBg,
+        containerColor = ZeroBlack,
         topBar = {
             Row(
                 modifier = Modifier
@@ -113,15 +106,15 @@ fun HomeStudioScreen(
                         modifier = Modifier
                             .size(36.dp)
                             .clip(RoundedCornerShape(10.dp))
-                            .background(Brush.linearGradient(listOf(NeonViolet, ElectricCyan))),
+                            .background(Brush.linearGradient(listOf(ZeroViolet, ZeroAccent))),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(Icons.Default.MovieFilter, contentDescription = null, tint = Color.Black)
                     }
                     Spacer(Modifier.width(10.dp))
                     Column {
-                        Text("VibeCut Pro", fontWeight = FontWeight.ExtraBold, fontSize = 19.sp, color = TextPrimary)
-                        Text("Local Multi-Track GPU Studio", fontSize = 11.sp, color = TextSecondary)
+                        Text("ZERO", fontWeight = FontWeight.ExtraBold, fontSize = 19.sp, color = TextPrimary)
+                        Text("Pro video editor · GPU effects", fontSize = 11.sp, color = TextSecondary)
                     }
                 }
 
@@ -141,24 +134,12 @@ fun HomeStudioScreen(
             }
         },
         bottomBar = {
-            NavigationBar(containerColor = PanelDark, tonalElevation = 0.dp) {
+            NavigationBar(containerColor = ZeroSurface, tonalElevation = 0.dp) {
                 NavigationBarItem(
                     selected = activeSection == HomeNavSection.STUDIO,
                     onClick = { activeSection = HomeNavSection.STUDIO },
                     icon = { Icon(Icons.Default.VideoLibrary, contentDescription = null) },
                     label = { Text("Projects") }
-                )
-                NavigationBarItem(
-                    selected = activeSection == HomeNavSection.TEMPLATES,
-                    onClick = { activeSection = HomeNavSection.TEMPLATES },
-                    icon = { Icon(Icons.Default.DashboardCustomize, contentDescription = null) },
-                    label = { Text("Templates") }
-                )
-                NavigationBarItem(
-                    selected = activeSection == HomeNavSection.AI_HUB,
-                    onClick = { activeSection = HomeNavSection.AI_HUB },
-                    icon = { Icon(Icons.Default.AutoAwesome, contentDescription = null) },
-                    label = { Text("AI Studio") }
                 )
                 NavigationBarItem(
                     selected = activeSection == HomeNavSection.SETTINGS,
@@ -208,18 +189,6 @@ fun HomeStudioScreen(
                     onViewHistory = { historyTargetId = it.id }
                 )
 
-                HomeNavSection.TEMPLATES -> TemplatesMarketplaceSection(
-                    templates = templates,
-                    onSelectTemplate = { activeTemplateForDialog = it },
-                    onDeleteSaved = { viewModel.deleteSavedTemplate(it.id) }
-                )
-
-                HomeNavSection.AI_HUB -> AiQuickHubSection(
-                    onStartDemoWithAi = {
-                        viewModel.createDemoProject(AspectRatioPreset.REELS_9_16, onOpenEditor)
-                    }
-                )
-
                 HomeNavSection.SETTINGS -> StudioSettingsSection(
                     prefs = prefs,
                     cacheBytes = cacheBytes,
@@ -227,7 +196,6 @@ fun HomeStudioScreen(
                     onAutosaveChange = viewModel::updateAutosaveInterval,
                     onProxyToggle = viewModel::updateLowEndProxyMode,
                     onDefaultExportChange = viewModel::updateDefaultExport,
-                    onSaveExternalAi = viewModel::updateExternalAiSettings,
                     onClearCache = viewModel::clearCache
                 )
             }
@@ -320,18 +288,6 @@ fun HomeStudioScreen(
             onCreateFromGallerySelection = { title, aspect, uris ->
                 showNewProjectSheet = false
                 viewModel.createProjectWithUris(title, aspect, uris, onOpenEditor)
-            }
-        )
-    }
-
-    // Template Customizer Dialog
-    activeTemplateForDialog?.let { tpl ->
-        TemplateApplyDialog(
-            template = tpl,
-            onDismiss = { activeTemplateForDialog = null },
-            onConfirmApply = { uris, headline, subtitle, musicUri ->
-                activeTemplateForDialog = null
-                viewModel.applyMarketplaceTemplate(tpl, uris, headline, subtitle, musicUri, onOpenEditor)
             }
         )
     }
@@ -666,163 +622,6 @@ private fun ProjectDraftCard(
 }
 
 @Composable
-private fun TemplatesMarketplaceSection(
-    templates: List<ProjectTemplate>,
-    onSelectTemplate: (ProjectTemplate) -> Unit,
-    onDeleteSaved: (ProjectTemplate) -> Unit
-) {
-    var selectedCategory by remember { mutableStateOf<TemplateCategory?>(null) }
-    val filtered = remember(templates, selectedCategory) {
-        if (selectedCategory == null) templates else templates.filter { it.category == selectedCategory }
-    }
-
-    Column(modifier = Modifier.fillMaxSize()) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            FilterChip(
-                selected = selectedCategory == null,
-                onClick = { selectedCategory = null },
-                label = { Text("All (${templates.size})") }
-            )
-            TemplateCategory.entries.forEach { cat ->
-                FilterChip(
-                    selected = selectedCategory == cat,
-                    onClick = { selectedCategory = cat },
-                    label = { Text("${cat.badgeEmoji} ${cat.label}") }
-                )
-            }
-        }
-
-        LazyVerticalGrid(
-            columns = GridCells.Adaptive(minSize = 165.dp),
-            contentPadding = PaddingValues(16.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-            modifier = Modifier.fillMaxSize()
-        ) {
-            items(filtered, key = { it.id }) { tpl ->
-                val accent = Color(tpl.accentColorHex)
-                Column(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(18.dp))
-                        .background(PanelDark)
-                        .border(1.dp, accent.copy(alpha = 0.4f), RoundedCornerShape(18.dp))
-                        .clickable { onSelectTemplate(tpl) }
-                        .padding(14.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(tpl.category.badgeEmoji, fontSize = 20.sp)
-                        Surface(
-                            color = accent.copy(alpha = 0.18f),
-                            shape = RoundedCornerShape(6.dp)
-                        ) {
-                            Text(
-                                text = "${tpl.aspectRatio.label} • ${tpl.slotCount} clips",
-                                color = accent,
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
-                            )
-                        }
-                    }
-                    Spacer(Modifier.height(10.dp))
-                    Text(tpl.name, fontWeight = FontWeight.Bold, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Spacer(Modifier.height(4.dp))
-                    Text(tpl.description, fontSize = 11.sp, color = TextSecondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    Spacer(Modifier.height(10.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("${tpl.bpm} BPM • ${tpl.totalDurationMs / 1000}s", fontSize = 10.sp, color = TextSecondary)
-                        if (tpl.isUserSaved) {
-                            IconButton(onClick = { onDeleteSaved(tpl) }, modifier = Modifier.size(22.dp)) {
-                                Icon(Icons.Default.Delete, contentDescription = "Delete template", tint = CoralRed, modifier = Modifier.size(16.dp))
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun AiQuickHubSection(onStartDemoWithAi: () -> Unit) {
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(18.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        item {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = SurfaceElevated),
-                shape = RoundedCornerShape(20.dp)
-            ) {
-                Column(Modifier.padding(18.dp)) {
-                    Text("Modular On-Device AI Engine", style = MaterialTheme.typography.titleLarge)
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        "All 17 AI features run real signal, frame & ML Kit models inside the editor (Face Detection, Subject Segmentation, Chi-Square Scene Cuts, PCM Beat Sync & Hindi/English Speech Recognition).",
-                        fontSize = 12.sp,
-                        color = TextSecondary
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    Button(
-                        onClick = onStartDemoWithAi,
-                        colors = ButtonDefaults.buttonColors(containerColor = NeonViolet)
-                    ) {
-                        Icon(Icons.Default.Bolt, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
-                        Text("Open Studio with Sample Clips to Run AI")
-                    }
-                }
-            }
-        }
-
-        items(AiToolType.entries) { tool ->
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(PanelDark)
-                    .border(1.dp, SurfaceStroke, RoundedCornerShape(14.dp))
-                    .padding(14.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text(tool.title, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                    Text(tool.subtitle, fontSize = 12.sp, color = TextSecondary)
-                }
-                Surface(
-                    color = ElectricCyan.copy(alpha = 0.14f),
-                    shape = RoundedCornerShape(8.dp)
-                ) {
-                    Text(
-                        text = tool.badge,
-                        color = ElectricCyan,
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
 private fun StudioSettingsSection(
     prefs: com.vibecut.pro.data.preferences.StudioPreferences,
     cacheBytes: Long,
@@ -830,11 +629,8 @@ private fun StudioSettingsSection(
     onAutosaveChange: (Int) -> Unit,
     onProxyToggle: (Boolean) -> Unit,
     onDefaultExportChange: (String, String) -> Unit,
-    onSaveExternalAi: (String, String) -> Unit,
     onClearCache: () -> Unit
 ) {
-    var aiUrl by remember(prefs.externalAiEndpointUrl) { mutableStateOf(prefs.externalAiEndpointUrl) }
-    var aiKey by remember(prefs.externalAiApiKey) { mutableStateOf(prefs.externalAiApiKey) }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -898,36 +694,6 @@ private fun StudioSettingsSection(
                                 label = { Text("${fr.fps} FPS") }
                             )
                         }
-                    }
-                }
-            }
-        }
-
-        item {
-            Card(colors = CardDefaults.cardColors(containerColor = PanelDark)) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Optional External GenAI Endpoint", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    Text(
-                        "On-device AI works offline out-of-the-box. Configure a custom REST endpoint only if using cloud neural object inpainting.",
-                        fontSize = 11.sp,
-                        color = TextSecondary
-                    )
-                    OutlinedTextField(
-                        value = aiUrl,
-                        onValueChange = { aiUrl = it },
-                        label = { Text("REST Endpoint URL (https://...)") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = aiKey,
-                        onValueChange = { aiKey = it },
-                        label = { Text("Bearer API Key (Optional)") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Button(onClick = { onSaveExternalAi(aiUrl, aiKey) }) {
-                        Text("Save AI Endpoint")
                     }
                 }
             }
@@ -1095,72 +861,4 @@ private fun NewProjectPickerSheet(
             Spacer(Modifier.height(16.dp))
         }
     }
-}
-
-@Composable
-private fun TemplateApplyDialog(
-    template: ProjectTemplate,
-    onDismiss: () -> Unit,
-    onConfirmApply: (List<Uri>, String, String, Uri?) -> Unit
-) {
-    var headline by remember(template) { mutableStateOf(template.defaultHeadlineText) }
-    var subtitle by remember(template) { mutableStateOf(template.defaultSubtitleText) }
-    var chosenClipUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
-    var chosenMusicUri by remember { mutableStateOf<Uri?>(null) }
-
-    val clipPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickMultipleVisualMedia(template.slotCount.coerceAtLeast(2))
-    ) { uris -> if (uris.isNotEmpty()) chosenClipUris = uris }
-
-    val musicPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri -> if (uri != null) chosenMusicUri = uri }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = PanelDark,
-        title = { Text("${template.category.badgeEmoji} ${template.name}") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(
-                    "${template.description}\nRequires ${template.slotCount} slots (${template.aspectRatio.label} • ${template.bpm} BPM).",
-                    fontSize = 12.sp,
-                    color = TextSecondary
-                )
-                OutlinedTextField(
-                    value = headline,
-                    onValueChange = { headline = it },
-                    label = { Text("Headline Text") },
-                    singleLine = true
-                )
-                OutlinedTextField(
-                    value = subtitle,
-                    onValueChange = { subtitle = it },
-                    label = { Text("Subtitle / Lower Third") },
-                    singleLine = true
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(
-                        onClick = {
-                            clipPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text(if (chosenClipUris.isEmpty()) "Pick ${template.slotCount} Clips" else "${chosenClipUris.size} Clips Ready")
-                    }
-                    OutlinedButton(onClick = { musicPicker.launch("audio/*") }) {
-                        Text(if (chosenMusicUri == null) "Music" else "Music ✓")
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            Button(onClick = { onConfirmApply(chosenClipUris, headline, subtitle, chosenMusicUri) }) {
-                Text(if (chosenClipUris.isEmpty()) "Try with Demo Clips" else "Apply Template")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        }
-    )
 }

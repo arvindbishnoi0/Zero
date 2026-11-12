@@ -32,13 +32,4 @@ interface VibeCutDao {
 
     @Query("DELETE FROM project_revisions WHERE projectId = :projectId AND revisionId NOT IN (SELECT revisionId FROM project_revisions WHERE projectId = :projectId ORDER BY savedAtMs DESC LIMIT 25)")
     suspend fun pruneOldRevisions(projectId: String)
-
-    @Query("SELECT * FROM saved_templates ORDER BY createdAtMs DESC")
-    fun observeSavedTemplates(): Flow<List<SavedTemplateEntity>>
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertTemplate(entity: SavedTemplateEntity)
-
-    @Query("DELETE FROM saved_templates WHERE id = :templateId")
-    suspend fun deleteTemplate(templateId: String)
 }
