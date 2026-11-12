@@ -648,7 +648,7 @@ fun MultiTrackTimeline(
                     modifier = Modifier
                         .width(86.dp)
                         .fillMaxHeight()
-                        .verticalScroll(rememberScrollState())
+                        .verticalScroll(verticalScroll)
                         .background(PanelDark)
                         .padding(top = 22.dp)
                 ) {
@@ -664,7 +664,6 @@ fun MultiTrackTimeline(
                 }
 
                 // Right Scrollable Lanes + Time Ruler + Playhead Line
-                val verticalScroll = rememberScrollState()
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -679,6 +678,7 @@ fun MultiTrackTimeline(
                         TimeRulerBar(
                             totalSeconds = totalTimelineSec.toInt(),
                             dpPerSec = dpPerSec,
+                            horizontalOffsetPx = scrollState.value,
                             onSeekMs = onSeekMs
                         )
 
@@ -781,6 +781,7 @@ private fun TrackHeaderCell(
 private fun TimeRulerBar(
     totalSeconds: Int,
     dpPerSec: Float,
+    horizontalOffsetPx: Int,
     onSeekMs: (Long) -> Unit
 ) {
     val density = LocalDensity.current
@@ -792,14 +793,14 @@ private fun TimeRulerBar(
             .pointerInput(dpPerSec) {
                 detectTapGestures { offset ->
                     val pxPerSec = with(density) { dpPerSec.dp.toPx() }
-                    val targetMs = ((offset.x / pxPerSec) * 1000f).toLong().coerceAtLeast(0L)
+                    val targetMs = (((offset.x + horizontalOffsetPx) / pxPerSec) * 1000f).toLong().coerceAtLeast(0L)
                     onSeekMs(targetMs)
                 }
             }
             .pointerInput(dpPerSec) {
                 detectDragGestures { change, _ ->
                     val pxPerSec = with(density) { dpPerSec.dp.toPx() }
-                    val targetMs = ((change.position.x / pxPerSec) * 1000f).toLong().coerceAtLeast(0L)
+                    val targetMs = (((change.position.x + horizontalOffsetPx) / pxPerSec) * 1000f).toLong().coerceAtLeast(0L)
                     onSeekMs(targetMs)
                 }
             }
