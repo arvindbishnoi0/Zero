@@ -1,14 +1,19 @@
 package com.vibecut.pro
 
-import com.vibecut.pro.engine.ai.LocalAiAlgorithms
 import com.vibecut.pro.engine.model.*
+import com.vibecut.pro.engine.timeline.ExportSegmentPlanner
 import com.vibecut.pro.engine.timeline.ImportedMediaSource
 import com.vibecut.pro.engine.timeline.TimelineEngine
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
+/**
+ * App-side (pure JVM) checks for the two things users notice most: export settings that produce a
+ * sane file, and the timeline/playlist maths that keeps the playhead honest.
+ */
 class ExportAndTimelineAppTest {
 
     @Test
@@ -39,21 +44,31 @@ class ExportAndTimelineAppTest {
             customBitrateMbps = 25f
         ).targetVideoBitrateBps(aspect)
         assertEquals(25_000_000, custom25Mbps)
+
+        // H.265 must be cheaper at the same visual setting (same resolution + fps).
+        val h264 = ExportConfig(bitrateTier = BitrateTier.HIGH, codec = VideoCodecOption.H264)
+            .targetVideoBitrateBps(aspect)
+        val h265 = ExportConfig(bitrateTier = BitrateTier.HIGH, codec = VideoCodecOption.H265)
+            .targetVideoBitrateBps(aspect)
+        assertTrue(h265 < h264)
+
+        // Every offered frame rate stays inside a legal range and estimates a plausible file size.
+        ExportFrameRate.entries.forEach { fps ->
+            val cfg = ExportConfig(frameRate = fps)
+            assertTrue(cfg.estimatedFileSizeMb(10_000L, aspect) > 0f)
+        }
     }
 
     @Test
-    fun scriptToVideoMultiEffectStackingAndApplyToAllClipsPreserveIntegrity() {
-        var project = Project(title = "AI Script Reel", aspectRatio = AspectRatioPreset.YOUTUBE_16_9)
+    fun effectStackingAndApplyToAllClipsPreserveIntegrity() {
+        var project = Project(title = "ZERO Reel", aspectRatio = AspectRatioPreset.WIDE_16_9)
         val media = listOf(
             ImportedMediaSource("file:///a.mp4", "Scene A", MediaKind.VIDEO, 5_000L, hasAudioTrack = true),
             ImportedMediaSource("file:///b.mp4", "Scene B", MediaKind.VIDEO, 5_000L, hasAudioTrack = false)
         )
-        project = LocalAiAlgorithms.buildScriptToVideoProject(
-            baseProject = project,
-            scriptText = "Opening shot in 4K\nSharp details with GPU shader\nSmooth dissolve finale",
-            availableMedia = media
-        )
-        assertEquals(3, project.subtitles.size)
+        project = TimelineEngine.importMediaClips(project, media, TrackType.VIDEO_MAIN)
+        assertEquals(2, project.mainVideoClips.size)
+        assertEquals(10_000L, project.totalDurationMs)
 
         val firstClip = project.mainVideoClips.first()
         project = TimelineEngine.addOrUpdateEffect(
@@ -69,9 +84,8 @@ class ExportAndTimelineAppTest {
         val updated = project.findClip(firstClip.id)!!
         assertEquals(2, updated.effects.size)
 
-        // Apply color grade & effects across all main clips
         val proGrade = ColorGradeConfig(
-            lutPresetId = "preset-cinematic-gold",
+            lutPresetId = "preset-teal-orange",
             lutIntensity = 0.85f,
             sharpness = 0.50f,
             clarity = 0.25f
@@ -81,12 +95,79 @@ class ExportAndTimelineAppTest {
         project = TimelineEngine.applyEffectsToAllMainClips(project, updated.effects)
 
         for (mc in project.mainVideoClips) {
-            assertEquals("preset-cinematic-gold", mc.colorGrade.lutPresetId)
+            assertEquals("preset-teal-orange", mc.colorGrade.lutPresetId)
             assertEquals(0.50f, mc.colorGrade.sharpness, 0.001f)
             assertEquals(2, mc.effects.size)
         }
 
-        // Playhead at exact end of timeline still resolves last main clip cleanly
         assertNotNull(project.findMainClipAt(project.totalDurationMs))
+    }
+
+    @Test
+    fun previewPlaylistIsContiguousAndFrameAccurate() {
+        var project = Project(title = "Playlist", aspectRatio = AspectRatioPreset.REELS_9_16)
+        project = TimelineEngine.importMediaClips(
+            project,
+            listOf(
+                ImportedMediaSource("file:///a.mp4", "A", MediaKind.VIDEO, 4_000L),
+                ImportedMediaSource("file:///still.jpg", "Still", MediaKind.IMAGE, 3_000L, hasAudioTrack = false),
+                ImportedMediaSource("file:///c.mp4", "C", MediaKind.VIDEO, 6_000L)
+            ),
+            TrackType.VIDEO_MAIN
+        )
+
+        // 2x one clip: its slot must shrink, and the playlist must still tile the timeline.
+        val firstId = project.mainVideoClips[0].id
+        project = TimelineEngine.setClipSpeed(project, firstId, 2f)
+
+        val pieces = ExportSegmentPlanner.planPreviewPlaylist(project)
+        assertTrue(pieces.isNotEmpty())
+        assertEquals(project.totalDurationMs, pieces.sumOf { it.timelineSpanMs })
+
+        var cursor = 0L
+        pieces.forEach { piece ->
+            assertEquals(cursor, piece.clip.startTimeOnTrackMs + piece.segmentOffsetMs)
+            cursor += piece.timelineSpanMs
+            assertTrue(piece.sourceEndMs > piece.sourceStartMs)
+            assertTrue(piece.speed >= 0.1f)
+        }
+
+        // The image piece is marked as a held still so the UI can draw it instead of decoding.
+        assertTrue(pieces.any { it.isHeldStill })
+
+        // Timeline must equal clip spans exactly (no gaps, no overlaps).
+        val mainClips = project.mainVideoClips.sortedBy { it.startTimeOnTrackMs }
+        var trackCursor = 0L
+        mainClips.forEach {
+            assertEquals(trackCursor, it.startTimeOnTrackMs)
+            trackCursor += it.timelineDurationMs
+        }
+        assertEquals(project.totalDurationMs, trackCursor)
+    }
+
+    @Test
+    fun exportSegmentsNeverOverlapAndRespectSpeed() {
+        var project = Project(title = "Segments")
+        project = TimelineEngine.importMediaClips(
+            project,
+            listOf(
+                ImportedMediaSource("file:///a.mp4", "A", MediaKind.VIDEO, 6_000L),
+                ImportedMediaSource("file:///b.mp4", "B", MediaKind.VIDEO, 4_000L)
+            ),
+            TrackType.VIDEO_MAIN
+        )
+        val planned = ExportSegmentPlanner.planVisualTracks(project)
+        assertTrue(planned.isNotEmpty())
+        var previousEnd = 0L
+        planned.forEach { p ->
+            assertTrue("segments must not overlap", p.segment.timelineStartMs >= previousEnd)
+            previousEnd = p.segment.timelineEndMs
+        }
+        assertEquals(project.totalDurationMs, ExportSegmentPlanner.totalExportDurationMs(project))
+
+        // Audio planning must skip silent clips entirely.
+        val audio = ExportSegmentPlanner.planAudioTracks(project)
+        assertTrue(audio.all { it.clip.hasAudioTrack })
+        assertFalse(audio.any { it.clip.sourceName == "B" })
     }
 }

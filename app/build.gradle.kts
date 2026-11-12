@@ -23,10 +23,30 @@ android {
         }
     }
 
+    signingConfigs {
+        // Release signing is driven by CI secrets; local builds fall back to the debug keystore so
+        // `assembleRelease` always produces an installable APK instead of failing the build.
+        create("release") {
+            val storePath = System.getenv("ZERO_KEYSTORE_PATH")
+            if (!storePath.isNullOrBlank()) {
+                storeFile = file(storePath)
+                storePassword = System.getenv("ZERO_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ZERO_KEY_ALIAS")
+                keyPassword = System.getenv("ZERO_KEY_PASSWORD")
+            } else {
+                storeFile = file("${System.getProperty("user.home")}/.android/debug.keystore")
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

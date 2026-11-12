@@ -22,6 +22,8 @@ import com.vibecut.pro.engine.color.ColorGradingEngine
 import com.vibecut.pro.engine.color.CubeLut3D
 import com.vibecut.pro.engine.keyframes.KeyframeInterpolator
 import com.vibecut.pro.engine.model.*
+import com.vibecut.pro.engine.timeline.ExportSegmentPlanner
+import com.vibecut.pro.engine.timeline.SpeedSegmentPlan
 import com.vibecut.pro.media.shader.ClipEffectsFactory
 import com.vibecut.pro.media.shader.VibeCutDspAudioProcessor
 import com.vibecut.pro.media.shader.VibeCutSceneOverlay
@@ -176,7 +178,8 @@ class VibeCutExportEngine @Inject constructor(
         val targetShortSide = clampSupportedShortSide(
             aspect = project.aspectRatio,
             requestedShortSide = effectiveRes.shortSidePx,
-            preferHevc = !forceAvcFallback && config.codec == VideoCodecOption.H265 && isHevcHardwareSupported()
+            preferHevc = !forceAvcFallback && config.codec == VideoCodecOption.H265 && isHevcHardwareSupported(),
+            customRatio = project.customAspectRatio
         )
 
         val exportDir = File(context.getExternalFilesDir(null) ?: context.filesDir, "exports").apply { mkdirs() }
@@ -185,70 +188,62 @@ class VibeCutExportEngine @Inject constructor(
 
         var anyMainClipKeepsAudio = false
 
-        val mainEditedItems = mainClips.map { clip ->
-            val clipUri = parseMediaUri(clip.sourceUri)
+        // Clips whose speed ramps (or plays backwards) cannot be expressed with Media3's constant
+        // speed provider, so each is expanded into frame-accurate constant-speed segments.
+        val mainEditedItems = mainClips.flatMap { clip ->
             val isImageItem = clip.mediaKind == MediaKind.IMAGE
             val hasRealAudio = !isImageItem &&
                 !clip.isFrozenFrame &&
                 clip.hasAudioTrack &&
                 probeHasAudioTrackCached(clip.sourceUri)
-
             val removeAudio = !hasRealAudio || mainTrack.isMuted || clip.isMuted
-            if (!removeAudio) {
-                anyMainClipKeepsAudio = true
-            }
+            if (!removeAudio) anyMainClipKeepsAudio = true
 
-            val mediaItem = if (isImageItem) {
-                MediaItem.Builder()
-                    .setUri(clipUri)
-                    .setMimeType(clip.mimeType.ifBlank { MimeTypes.IMAGE_JPEG })
-                    .setImageDurationMs(clip.timelineDurationMs.coerceAtLeast(100L))
-                    .build()
-            } else {
-                val startPosMs = if (clip.isFrozenFrame) {
-                    clip.freezeFrameSourceMs.coerceAtLeast(0L)
-                } else {
-                    clip.trimStartMs.coerceAtLeast(0L)
-                }
-                val rawEndMs = if (clip.isFrozenFrame) {
-                    (startPosMs + 120L).coerceAtMost(clip.sourceDurationMs.coerceAtLeast(startPosMs + 80L))
-                } else {
-                    clip.effectiveTrimEndMs
-                }
-                val safeEndMs = rawEndMs.coerceAtLeast(startPosMs + 60L)
-                MediaItem.Builder()
-                    .setUri(clipUri)
-                    .setClippingConfiguration(
-                        MediaItem.ClippingConfiguration.Builder()
-                            .setStartPositionMs(startPosMs)
-                            .setEndPositionMs(safeEndMs)
-                            .build()
+            val planned = ExportSegmentPlanner.planClip(clip)
+            val segments = planned.ifEmpty {
+                listOf(
+                    SpeedSegmentPlan(
+                        clipId = clip.id,
+                        segmentIndex = 0,
+                        totalSegments = 1,
+                        sourceStartMs = clip.mapTimelineOffsetToSourceMs(0L),
+                        sourceEndMs = clip.mapTimelineOffsetToSourceMs(clip.timelineDurationMs),
+                        timelineStartMs = clip.startTimeOnTrackMs,
+                        timelineEndMs = clip.endTimeOnTrackMs,
+                        speed = clip.clampedSpeed,
+                        isReversed = clip.isReversed,
+                        isFrozen = clip.isFrozenFrame
                     )
-                    .build()
+                )
             }
 
-            val effects = ClipEffectsFactory.buildFullClipEffects(
-                context = context,
-                clip = clip,
-                project = project,
-                trackVolume = if (mainTrack.isMuted) 0f else mainTrack.volume,
-                includeAudioProcessor = !removeAudio,
-                includeSceneOverlays = true,
-                targetExportHeight = targetShortSide,
-                targetFps = config.frameRate.fps,
-                useCodecSafeAlignment = true
-            )
+            segments.map { seg ->
+                val mediaItem = buildSegmentMediaItem(clip, seg)
+                val effects = ClipEffectsFactory.buildFullClipEffects(
+                    context = context,
+                    clip = clip,
+                    project = project,
+                    trackVolume = if (mainTrack.isMuted) 0f else mainTrack.volume,
+                    includeAudioProcessor = !removeAudio,
+                    includeSceneOverlays = true,
+                    targetExportHeight = targetShortSide,
+                    useCodecSafeAlignment = true,
+                    segmentSpeed = if (seg.isFrozen) 1f else seg.speed,
+                    applySpeedProvider = !clip.hasSpeedRamp && !seg.isFrozen,
+                    segmentTimelineOffsetMs = seg.timelineStartMs - clip.startTimeOnTrackMs
+                )
 
-            val itemBuilder = EditedMediaItem.Builder(mediaItem)
-                .setRemoveVideo(false)
-                .setRemoveAudio(removeAudio)
-                .setFrameRate(config.frameRate.fps)
-                .setEffects(effects)
+                val itemBuilder = EditedMediaItem.Builder(mediaItem)
+                    .setRemoveVideo(false)
+                    .setRemoveAudio(removeAudio)
+                    .setFrameRate(config.frameRate.fps)
+                    .setEffects(effects)
 
-            if (isImageItem) {
-                itemBuilder.setDurationUs(clip.timelineDurationMs.coerceAtLeast(100L) * 1_000L)
+                if (isImageItem) {
+                    itemBuilder.setDurationUs(seg.timelineDurationMs.coerceAtLeast(100L) * 1_000L)
+                }
+                itemBuilder.build()
             }
-            itemBuilder.build()
         }
 
         val sequences = mutableListOf<EditedMediaItemSequence>()
@@ -270,12 +265,18 @@ class VibeCutExportEngine @Inject constructor(
             MimeTypes.VIDEO_H264
         }
 
-        val (alignedW, alignedH) = project.aspectRatio.computeCodecSafeDimensions(targetShortSide, alignment = 16)
+        // Always include the project's custom ratio so CUSTOM projects export at their real shape.
+        val (alignedW, alignedH) = AspectRatioPreset.dimensionsForProject(
+            project.aspectRatio,
+            targetShortSide,
+            project.customAspectRatio
+        )
         val safeBitrate = clampBitrateForEncoder(
             mimeType = selectedVideoMime,
             width = alignedW,
             height = alignedH,
-            requestedBitrate = config.copy(resolution = effectiveRes).targetVideoBitrateBps(project.aspectRatio)
+            requestedBitrate = config.copy(resolution = effectiveRes)
+                .targetVideoBitrateBps(project.aspectRatio, project.customAspectRatio)
         )
 
         val videoEncoderSettings = VideoEncoderSettings.Builder()
@@ -299,6 +300,41 @@ class VibeCutExportEngine @Inject constructor(
                 "Rendering ${effectiveRes.badge} ${config.frameRate.fps}fps • ${if (selectedVideoMime == MimeTypes.VIDEO_H265) "H.265" else "H.264"} ($pct%)"
             }
         )
+    }
+
+    /**
+     * Builds the clipped [MediaItem] for one constant-speed export segment. Frozen frames are
+     * handled by asking for a short source read; everything else clips to the segment's source range.
+     */
+    private fun buildSegmentMediaItem(clip: TimelineClip, seg: SpeedSegmentPlan): MediaItem {
+        val clipUri = parseMediaUri(clip.sourceUri)
+        if (clip.mediaKind == MediaKind.IMAGE) {
+            return MediaItem.Builder()
+                .setUri(clipUri)
+                .setMimeType(clip.mimeType.ifBlank { MimeTypes.IMAGE_JPEG })
+                .setImageDurationMs(seg.timelineDurationMs.coerceAtLeast(100L))
+                .build()
+        }
+        val startPosMs = if (clip.isFrozenFrame) {
+            clip.freezeFrameSourceMs.coerceAtLeast(0L)
+        } else {
+            seg.sourceStartMs.coerceAtLeast(0L)
+        }
+        val rawEndMs = if (clip.isFrozenFrame) {
+            (startPosMs + 120L).coerceAtMost(clip.sourceDurationMs.coerceAtLeast(startPosMs + 80L))
+        } else {
+            seg.sourceEndMs
+        }
+        val safeEndMs = rawEndMs.coerceAtLeast(startPosMs + 40L)
+        return MediaItem.Builder()
+            .setUri(clipUri)
+            .setClippingConfiguration(
+                MediaItem.ClippingConfiguration.Builder()
+                    .setStartPositionMs(startPosMs)
+                    .setEndPositionMs(safeEndMs)
+                    .build()
+            )
+            .build()
     }
 
     private suspend fun exportAudioOnlyInternal(
@@ -343,8 +379,7 @@ class VibeCutExportEngine @Inject constructor(
                         trackVolume = mainTrack.volume,
                         includeAudioProcessor = true,
                         includeSceneOverlays = false,
-                        targetExportHeight = null,
-                        targetFps = null
+                        targetExportHeight = null
                     )
                     seqBuilder.addItem(
                         EditedMediaItem.Builder(mediaItem)
@@ -923,12 +958,13 @@ class VibeCutExportEngine @Inject constructor(
     private fun clampSupportedShortSide(
         aspect: AspectRatioPreset,
         requestedShortSide: Int,
-        preferHevc: Boolean
+        preferHevc: Boolean,
+        customRatio: Float = aspect.ratioFloat
     ): Int {
         val mime = if (preferHevc) MimeTypes.VIDEO_H265 else MimeTypes.VIDEO_H264
         val candidates = listOf(requestedShortSide, 1440, 1080, 720).distinct().filter { it <= requestedShortSide }
         for (shortSide in candidates) {
-            val (w, h) = aspect.computeCodecSafeDimensions(shortSide, alignment = 16)
+            val (w, h) = AspectRatioPreset.dimensionsForProject(aspect, shortSide, customRatio)
             val supported = runCatching {
                 MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { info ->
                     info.isEncoder && info.supportedTypes.any { it.equals(mime, ignoreCase = true) } &&

@@ -15,6 +15,7 @@ import com.vibecut.pro.engine.audio.AudioDspEngine
 import com.vibecut.pro.engine.color.ColorGradingEngine
 import com.vibecut.pro.engine.keyframes.KeyframeInterpolator
 import com.vibecut.pro.engine.model.*
+import com.vibecut.pro.engine.timeline.ExportSegmentPlanner
 import com.vibecut.pro.media.shader.ClipEffectsFactory
 import com.vibecut.pro.media.shader.LivePreviewStateHolder
 import kotlinx.coroutines.*
@@ -22,18 +23,27 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
-import kotlin.math.abs
 
 /**
- * Real-time GPU-accelerated preview & multi-track audio synchronization controller.
+ * Preview playback engine for ZERO.
  *
- * Key upgrades:
- * - Uses [LivePreviewStateHolder] so Filter, Sharpen/Detail, Adjust, Transform, Crop, Transition,
- *   Before/After Compare, and Effect parameter sliders update OpenGL uniforms & the 2D-unwrapped
- *   3D Color LUT in-place without tearing down Media3's `VideoGraph`.
- * - Coalesced 30fps paused-frame GPU re-render (`requestPausedFrameRefresh`) ensures dragging any
- *   slider while paused immediately updates the visible video/photo frame with zero black flash.
- * - Supports both H.264 carrier clips and `MediaKind.IMAGE` fallback items.
+ * Invariants the timeline UI relies on:
+ *
+ *  1. **One clock.** [playheadMs] is derived from the playlist position
+ *     (`sum of completed item durations + currentPosition`) and nothing else writes it. The ruler,
+ *     playhead handle, clip highlight and transport controls therefore cannot drift apart.
+ *  2. **Timed playlist.** [ExportSegmentPlanner.planPreviewPlaylist] expands every main clip into
+ *     constant-speed pieces whose *slot* on the playlist equals its timeline span. Speed never
+ *     changes how long an item lasts, so a 2x clip still occupies its full timeline slot and the
+ *     next clip starts exactly where the timeline says it does.
+ *  3. **Exact seeks.** Every seek resolves timeline → clip → source timestamp with
+ *     [TimelineClip.mapTimelineOffsetToSourceMs], so scrubbing into a ramped or reversed clip lands
+ *     on the requested frame.
+ *  4. **Live parameters never rebuild the graph.** Sliders mutate [liveState] only; the VideoGraph
+ *     is rebuilt only when the shader *topology* changes (clip switch, effect added/removed,
+ *     enhancement toggled).
+ *  5. **Reverse is frame-stepped.** Media3 cannot play backwards, so reversed clips are stepped by
+ *     the ticker at the project frame rate instead of pretending to play.
  */
 @OptIn(UnstableApi::class)
 class EditorPreviewController(
@@ -42,12 +52,15 @@ class EditorPreviewController(
 ) {
     val videoPlayer: ExoPlayer = ExoPlayer.Builder(
         context,
-        DefaultRenderersFactory(context).setEnableDecoderFallback(true)
+        DefaultRenderersFactory(context)
+            .setEnableDecoderFallback(true)
+            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
     ).build().apply {
         repeatMode = Player.REPEAT_MODE_OFF
         playWhenReady = false
     }
 
+    /** Secondary player dedicated to music / voiceover / SFX tracks. */
     private val auxAudioPlayer: ExoPlayer = ExoPlayer.Builder(context).build().apply {
         repeatMode = Player.REPEAT_MODE_OFF
         playWhenReady = false
@@ -61,31 +74,66 @@ class EditorPreviewController(
     private val _playheadMs = MutableStateFlow(0L)
     val playheadMs: StateFlow<Long> = _playheadMs.asStateFlow()
 
+    /** True while the user drags the playhead — the ticker must not fight the gesture. */
+    @Volatile
+    var isUserScrubbing: Boolean = false
+
+    /**
+     * A frozen frame has no decodable span of its own (the source range is 1 ms wide), so preview
+     * would flash black while "playing" it. Instead the still is held as a Compose layer on top of
+     * the preview surface while the playhead advances over a silent clock.
+     */
+    private val _heldStillClip = MutableStateFlow<TimelineClip?>(null)
+    val heldStillClip: StateFlow<TimelineClip?> = _heldStillClip.asStateFlow()
+
+    /** True while the playhead walks a reversed clip backwards, one frame at a time. */
+    @Volatile
+    private var isReverseStepping: Boolean = false
+
+    /** Wall-clock accumulator so reversed playback runs at the real frame rate. */
+    private var reverseAccumulatorMs: Long = 0L
+
+    /** True while an image / frozen frame is held on screen and the playhead is driven by a clock. */
+    @Volatile
+    private var isHoldingStill: Boolean = false
+    private var stillClockMs: Long = 0L
+
     private var currentProject: Project? = null
     private var playlistSignature: String = ""
-    private var appliedStructuralFxSignature: String = ""
-    private var lastVisualParamSignature: Int = 0
+    private var structuralFxSignature: String = ""
+    private var lastVisualHash: Int = 0
     private var activeAuxClipId: String? = null
-    private var lowResProxyMode: Boolean = false
+    private var proxyHeight: Int? = null
     private var compareBypass: Boolean = false
     private var tickerJob: Job? = null
     private var pausedRefreshJob: Job? = null
+    private var frameSeekJob: Job? = null
+
+    /** The expanded playlist currently installed in [videoPlayer]. */
+    private var playlist: List<ExportSegmentPlanner.PreviewPiece> = emptyList()
+
+    /** Playback rate applied to the player for the current item (1 for pre-timed ramp pieces). */
+    private var currentItemSpeed: Float = 1f
 
     init {
         videoPlayer.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
-                _isPlaying.value = isPlaying
-                if (isPlaying) {
+                val active = isPlaying || isReverseStepping || isHoldingStill
+                _isPlaying.value = active
+                if (active) {
                     startTicker()
-                    syncAuxAudioPlayback(forceSeek = true)
+                    syncAuxPlayback(forceSeek = true)
                 } else {
                     stopTicker()
                     auxAudioPlayer.pause()
+                    reverseAccumulatorMs = 0L
                 }
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED) {
+                    val project = currentProject
+                    if (project != null) _playheadMs.value = project.totalDurationMs.coerceAtLeast(0L)
                     videoPlayer.pause()
                     auxAudioPlayer.pause()
                     _isPlaying.value = false
@@ -94,150 +142,330 @@ class EditorPreviewController(
         })
     }
 
-    fun syncProject(
-        project: Project,
-        lowResProxy: Boolean = lowResProxyMode,
-        isCompareBypass: Boolean = compareBypass
-    ) {
-        val prevProject = currentProject
-        currentProject = project
-        val proxyChanged = lowResProxy != lowResProxyMode
-        val compareChanged = isCompareBypass != compareBypass
-        lowResProxyMode = lowResProxy
-        compareBypass = isCompareBypass
+    // ------------------------------------------------------------------ project sync
 
+    /**
+     * Pushes [project] into the player. The playlist (and its pre-timed slots) is rebuilt only when
+     * the clip layout / trims / speeds change; effect parameters reuse the warm VideoGraph.
+     */
+    fun syncProject(project: Project, isCompareBypass: Boolean = compareBypass) {
+        currentProject = project
+        compareBypass = isCompareBypass
         liveState.customPresets = project.customColorPresets
         liveState.isCompareBypass = isCompareBypass
+        liveState.enhancement = project.enhancement
+        liveState.projectAspect = project.aspectRatio
+        liveState.projectCustomRatio = project.customAspectRatio
+        proxyHeight = project.previewQuality.proxyHeight
 
-        val mainClips = project.mainVideoClips
-        val newPlaylistSig = mainClips.joinToString("|") {
-            "${it.id}:${it.sourceUri}:${it.mediaKind}:${it.trimStartMs}:${it.trimEndMs}:${it.timelineDurationMs}:${it.isReversed}"
-        }
-
-        val playlistRebuilt = newPlaylistSig != playlistSignature
-        if (playlistRebuilt) {
-            playlistSignature = newPlaylistSig
-            val wasPlaying = videoPlayer.isPlaying
-            val savedTimelineMs = _playheadMs.value
-
-            val items = mainClips.map { clip -> buildMediaItemForClip(clip) }
-
-            videoPlayer.setMediaItems(items, /* resetPosition= */ true)
-            if (items.isNotEmpty()) {
-                videoPlayer.prepare()
-                seekToTimelineMs(savedTimelineMs.coerceIn(0L, project.totalDurationMs.coerceAtLeast(1L)))
-                if (wasPlaying) videoPlayer.play()
-            } else {
-                appliedStructuralFxSignature = ""
+        val planned = ExportSegmentPlanner.planPreviewPlaylist(project)
+        val newSignature = buildString(256) {
+            planned.forEach { piece ->
+                append(piece.clip.id).append(':')
+                    .append(piece.clip.sourceUri).append(':')
+                    .append(piece.clip.mediaKind).append(':')
+                    .append(piece.sourceStartMs).append(':')
+                    .append(piece.sourceEndMs).append(':')
+                    .append(piece.timelineSpanMs).append(':')
+                    .append(piece.segmentOffsetMs).append(':')
+                    .append(piece.speed).append(':')
+                    .append(piece.isReversed).append(';')
             }
         }
 
-        // Apply live state & check if structural or parameter refresh is needed
-        val visualChanged = applyActiveClipStateAndEffects(forceRebuild = proxyChanged || playlistRebuilt)
-        if ((visualChanged || compareChanged || prevProject == null) && !videoPlayer.isPlaying && mainClips.isNotEmpty()) {
+        if (newSignature != playlistSignature) {
+            playlistSignature = newSignature
+            playlist = planned
+            val wasPlaying = videoPlayer.isPlaying
+            val savedMs = _playheadMs.value
+            val items = planned.map { toMediaItem(it) }
+            videoPlayer.setMediaItems(items, /* resetPosition= */ true)
+            if (items.isNotEmpty()) {
+                videoPlayer.prepare()
+                seekToTimelineMs(savedMs.coerceAtMost(project.totalDurationMs.coerceAtLeast(0L)))
+                if (wasPlaying) resumeAfterRebuild()
+            } else {
+                structuralFxSignature = ""
+                _playheadMs.value = 0L
+                videoPlayer.stop()
+            }
+        }
+
+        val changed = applyActiveClipStateAndEffects()
+        if (changed && !videoPlayer.isPlaying && project.mainVideoClips.isNotEmpty()) {
             requestPausedFrameRefresh()
         }
-        syncAuxAudioPlayback(forceSeek = false)
+        syncAuxPlayback(forceSeek = false)
     }
 
-    private fun buildMediaItemForClip(clip: TimelineClip): MediaItem {
-        val uri = parseClipUri(clip.sourceUri)
-        if (clip.mediaKind == MediaKind.IMAGE) {
+    private fun toMediaItem(piece: ExportSegmentPlanner.PreviewPiece): MediaItem {
+        val clip = piece.clip
+        val uri = parseUri(clip.sourceUri)
+        if (piece.isStillImage) {
             return MediaItem.Builder()
                 .setUri(uri)
                 .setMimeType(clip.mimeType.ifBlank { MimeTypes.IMAGE_JPEG })
-                .setImageDurationMs(clip.timelineDurationMs.coerceAtLeast(100L))
+                .setImageDurationMs(piece.timelineSpanMs.coerceAtLeast(100L))
                 .setMediaId(clip.id)
                 .build()
         }
-
-        val endMs = if (clip.isFrozenFrame) {
-            (clip.trimStartMs + 66L).coerceAtMost(clip.sourceDurationMs.coerceAtLeast(100L))
-        } else {
-            clip.effectiveTrimEndMs.coerceAtLeast(clip.trimStartMs + 50L)
-        }
-
+        // A frozen frame only has a 1 ms source span; its visual is held by the UI, so the playlist
+        // entry is just a placeholder that never needs to decode a picture.
+        val safeEnd = if (piece.isHeldStill) piece.sourceStartMs + 4L
+        else piece.sourceEndMs.coerceAtLeast(piece.sourceStartMs + 40L)
         return MediaItem.Builder()
             .setUri(uri)
             .setClippingConfiguration(
                 MediaItem.ClippingConfiguration.Builder()
-                    .setStartPositionMs(clip.trimStartMs.coerceAtLeast(0L))
-                    .setEndPositionMs(endMs)
+                    .setStartPositionMs(piece.sourceStartMs.coerceAtLeast(0L))
+                    .setEndPositionMs(safeEnd)
                     .build()
             )
             .setMediaId(clip.id)
             .build()
     }
 
+    private fun resumeAfterRebuild() {
+        val project = currentProject ?: return
+        val clip = project.findMainClipAt(_playheadMs.value)
+        val wantsStill = clip != null && (clip.mediaKind == MediaKind.IMAGE || clip.isFrozenFrame)
+        val wantsReverse = clip != null && clip.isReversed && !clip.isFrozenFrame &&
+            clip.mediaKind == MediaKind.VIDEO
+        when {
+            wantsStill -> {
+                isHoldingStill = true
+                stillClockMs = _playheadMs.value
+                _isPlaying.value = true
+                startTicker()
+            }
+            wantsReverse -> {
+                isReverseStepping = true
+                _isPlaying.value = true
+                startTicker()
+            }
+            else -> {
+                isReverseStepping = false
+                isHoldingStill = false
+                videoPlayer.play()
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ transport
+
     fun togglePlayPause() {
-        val proj = currentProject ?: return
-        if (proj.mainVideoClips.isEmpty()) return
-        if (videoPlayer.isPlaying) {
-            videoPlayer.pause()
-            auxAudioPlayer.pause()
+        val project = currentProject ?: return
+        if (project.mainVideoClips.isEmpty()) return
+        if (videoPlayer.isPlaying || isReverseStepping) {
+            pause()
         } else {
             if (videoPlayer.playbackState == Player.STATE_ENDED ||
-                (proj.totalDurationMs > 0L && _playheadMs.value >= proj.totalDurationMs - 40L)
+                _playheadMs.value >= project.totalDurationMs - 40L
             ) {
                 seekToTimelineMs(0L)
             }
-            if (videoPlayer.playbackState == Player.STATE_IDLE) {
-                videoPlayer.prepare()
+            startPlayback()
+        }
+    }
+
+    fun play() {
+        val project = currentProject ?: return
+        if (project.mainVideoClips.isEmpty()) return
+        startPlayback()
+    }
+
+    private fun startPlayback() {
+        val project = currentProject ?: return
+        val clip = project.findMainClipAt(_playheadMs.value)
+        val wantsStill = clip != null && (clip.mediaKind == MediaKind.IMAGE || clip.isFrozenFrame)
+        val wantsReverse = clip != null && clip.isReversed && !clip.isFrozenFrame &&
+            clip.mediaKind == MediaKind.VIDEO
+        when {
+            wantsStill -> {
+                isHoldingStill = true
+                isReverseStepping = false
+                stillClockMs = _playheadMs.value
+                _isPlaying.value = true
+                startTicker()
+                syncAuxPlayback(forceSeek = true)
             }
-            videoPlayer.play()
+            wantsReverse -> {
+                isReverseStepping = true
+                isHoldingStill = false
+                reverseAccumulatorMs = 0L
+                _isPlaying.value = true
+                startTicker()
+            }
+            else -> {
+                isReverseStepping = false
+                isHoldingStill = false
+                if (videoPlayer.playbackState == Player.STATE_IDLE) videoPlayer.prepare()
+                videoPlayer.play()
+            }
         }
     }
 
     fun pause() {
-        if (videoPlayer.isPlaying) {
-            videoPlayer.pause()
-        }
+        isReverseStepping = false
+        isHoldingStill = false
+        if (videoPlayer.isPlaying) videoPlayer.pause()
         auxAudioPlayer.pause()
+        _isPlaying.value = false
     }
 
-    fun seekToTimelineMs(timelineMs: Long) {
-        val proj = currentProject ?: return
-        val clamped = timelineMs.coerceIn(0L, proj.totalDurationMs.coerceAtLeast(0L))
+    /**
+     * Keeps the playback mechanism in sync with whichever clip the playhead is over: forward clips
+     * use the engine clock, reversed clips use the frame stepper.
+     */
+    private fun maintainPlaybackMode() {
+        val project = currentProject ?: return
+        if (!_isPlaying.value) return
+        val clip = project.findMainClipAt(_playheadMs.value) ?: return
+        val wantsReverse = clip.isReversed && !clip.isFrozenFrame && clip.mediaKind == MediaKind.VIDEO
+        val wantsStill = clip.mediaKind == MediaKind.IMAGE || clip.isFrozenFrame
+        if (wantsStill && !isHoldingStill) {
+            isHoldingStill = true
+            stillClockMs = _playheadMs.value
+            videoPlayer.pause()
+        } else if (wantsReverse && !isReverseStepping) {
+            isReverseStepping = true
+            videoPlayer.pause()
+        } else if (!wantsReverse && !wantsStill && (isReverseStepping || isHoldingStill)) {
+            isHoldingStill = false
+            isReverseStepping = false
+            isReverseStepping = false
+            val target = resolvePlaylistPosition(_playheadMs.value)
+            if (target != null && target.first in 0 until videoPlayer.mediaItemCount) {
+                videoPlayer.seekTo(target.first, target.second)
+                applyPlayerSpeed(pieceSpeedAt(target.first))
+                videoPlayer.play()
+            }
+        }
+    }
+
+    /**
+     * Seeks the timeline and returns the clamped position actually applied, so the UI keeps its
+     * playhead exactly where the player is.
+     */
+    fun seekToTimelineMs(timelineMs: Long): Long {
+        val project = currentProject ?: return 0L
+        val clamped = timelineMs.coerceIn(0L, project.totalDurationMs.coerceAtLeast(0L))
         _playheadMs.value = clamped
 
-        val mainClips = proj.mainVideoClips
-        if (mainClips.isEmpty()) return
-
-        var targetIndex = mainClips.indexOfFirst { clamped >= it.startTimeOnTrackMs && clamped < it.endTimeOnTrackMs }
-        if (targetIndex < 0) {
-            targetIndex = mainClips.indexOfLast { clamped >= it.startTimeOnTrackMs }.coerceAtLeast(0)
+        val clip = project.findMainClipAt(clamped)
+        if (clip == null) {
+            videoPlayer.pause()
+            return clamped
         }
-        val clip = mainClips[targetIndex]
-        val localTimelineOffset = (clamped - clip.startTimeOnTrackMs).coerceIn(0L, clip.timelineDurationMs)
+        val localOffset = (clamped - clip.startTimeOnTrackMs).coerceIn(0L, clip.timelineDurationMs)
         liveState.activeClip = clip
-        liveState.localClipOffsetMs = localTimelineOffset
+        liveState.localClipOffsetMs = localOffset
 
-        val sourcePosInClipMs = if (clip.mediaKind == MediaKind.IMAGE) {
-            localTimelineOffset
-        } else if (clip.isFrozenFrame) {
-            0L
-        } else {
-            (clip.mapTimelineOffsetToSourceMs(localTimelineOffset) - clip.trimStartMs)
-                .coerceIn(0L, clip.trimmedSourceDurationMs)
+        val target = resolvePlaylistPosition(clamped)
+        if (target != null) {
+            val (index, positionMs) = target
+            if (index in 0 until videoPlayer.mediaItemCount) {
+                videoPlayer.seekTo(index, positionMs)
+                currentItemSpeed = pieceSpeedAt(index)
+                applyPlayerSpeed(currentItemSpeed)
+            }
         }
 
-        if (videoPlayer.mediaItemCount > targetIndex) {
-            videoPlayer.seekTo(targetIndex, sourcePosInClipMs)
-        }
-        applyActiveClipStateAndEffects(forceRebuild = false)
-        syncAuxAudioPlayback(forceSeek = true)
+        applyActiveClipStateAndEffects()
+        syncAuxPlayback(forceSeek = true)
+        if (!videoPlayer.isPlaying && !isUserScrubbing) requestPausedFrameRefresh()
+        return clamped
     }
+
+    /**
+     * Maps a timeline position onto the expanded playlist: item index + player position.
+     *
+     * Because every piece is clipped to its exact source range and played at
+     * `sourceSpan / timelineSpan`, the player position is simply `offsetWithinPiece * speed`.
+     */
+    private fun resolvePlaylistPosition(timelineMs: Long): Pair<Int, Long>? {
+        if (playlist.isEmpty()) return null
+        var elapsed = 0L
+        playlist.forEachIndexed { index, piece ->
+            val duration = piece.timelineSpanMs
+            if (timelineMs < elapsed + duration) {
+                val within = (timelineMs - elapsed).coerceIn(0L, duration)
+                return index to playerPositionFor(piece, within)
+            }
+            elapsed += duration
+        }
+        val lastIndex = playlist.lastIndex
+        val last = playlist[lastIndex]
+        return lastIndex to playerPositionFor(last, last.timelineSpanMs)
+    }
+
+    /** Timeline offset inside a piece → player position in its clipped media item. */
+    private fun playerPositionFor(piece: ExportSegmentPlanner.PreviewPiece, withinMs: Long): Long {
+        if (piece.isStillImage) return withinMs.coerceAtLeast(0L)
+        val nativeSpan = (piece.sourceEndMs - piece.sourceStartMs).coerceAtLeast(1L)
+        val rate = piece.speed.coerceAtLeast(0.01f)
+        val pos = (withinMs * rate).toLong().coerceIn(0L, nativeSpan)
+        return if (piece.isReversed) (nativeSpan - pos).coerceIn(0L, nativeSpan) else pos
+    }
+
+    private fun pieceSpeedAt(index: Int): Float =
+        playlist.getOrNull(index)?.speed ?: 1f
+
+    private fun applyPlayerSpeed(speed: Float) {
+        val desired = speed.coerceIn(0.1f, 4f)
+        if (kotlin.math.abs(videoPlayer.playbackParameters.speed - desired) > 0.01f) {
+            videoPlayer.playbackParameters = PlaybackParameters(desired)
+        }
+    }
+
+    // ------------------------------------------------------------------ ticking
 
     private fun startTicker() {
         tickerJob?.cancel()
-        tickerJob = scope.launch(Dispatchers.Main) {
-            while (isActive && videoPlayer.isPlaying) {
-                updatePlayheadFromPlayer()
-                applyActiveClipStateAndEffects(forceRebuild = false)
-                syncAuxAudioPlayback(forceSeek = false)
-                delay(33L)
+        tickerJob = scope.launch(Dispatchers.Main.immediate) {
+            while (isActive && (videoPlayer.isPlaying || isReverseStepping || isHoldingStill)) {
+                if (!isUserScrubbing) {
+                    when {
+                        isHoldingStill -> advanceHeldStill()
+                        isReverseStepping -> stepReversedPlayback()
+                        else -> advancePlayheadFromPlayer()
+                    }
+                    maintainPlaybackMode()
+                }
+                applyActiveClipStateAndEffects()
+                syncAuxPlayback(forceSeek = false)
+                delay(TICK_MS)
             }
+            if (_isPlaying.value && isReverseStepping) _isPlaying.value = false
         }
+    }
+
+    /**
+     * Media3 cannot decode backwards, so reversed clips are played by seeking one frame earlier per
+     * frame interval. Everything else (GPU effects, keyframes, audio) follows the normal clock.
+     */
+    private fun stepReversedPlayback() {
+        val project = currentProject ?: return
+        val fps = project.exportConfig.frameRate.fps.coerceIn(1, 120)
+        val frameMs = (1000.0 / fps).toLong().coerceAtLeast(1L)
+
+        // Step at real time: accumulate tick time and advance one frame when a frame is due,
+        // otherwise reversed playback would run ~2.5x too fast at 30 fps.
+        reverseAccumulatorMs += TICK_MS
+        var steps = 0
+        while (reverseAccumulatorMs >= frameMs && steps < 4) {
+            reverseAccumulatorMs -= frameMs
+            steps++
+        }
+        if (steps == 0) return
+
+        val next = _playheadMs.value - frameMs * steps
+        if (next <= 0L) {
+            seekToTimelineMs(0L)
+            pause()
+            return
+        }
+        seekToTimelineMs(next)
     }
 
     private fun stopTicker() {
@@ -245,223 +473,241 @@ class EditorPreviewController(
         tickerJob = null
     }
 
-    private fun updatePlayheadFromPlayer() {
-        val proj = currentProject ?: return
-        val mainClips = proj.mainVideoClips
-        val idx = videoPlayer.currentMediaItemIndex
-        if (idx !in mainClips.indices) return
+    /** The only writer of [playheadMs] during playback. */
+    private fun advancePlayheadFromPlayer() {
+        val project = currentProject ?: return
+        val index = videoPlayer.currentMediaItemIndex
+        val piece = playlist.getOrNull(index) ?: return
 
-        val clip = mainClips[idx]
-        val playerPosMs = videoPlayer.currentPosition.coerceAtLeast(0L)
-
-        val currentSpeed = clip.instantaneousSpeedAt(0.5f)
-        val timelineOffset = if (clip.mediaKind == MediaKind.IMAGE) {
-            playerPosMs.coerceAtMost(clip.timelineDurationMs)
+        val elapsedBefore = playlist.take(index).sumOf { it.timelineSpanMs }
+        val playerPos = videoPlayer.currentPosition.coerceAtLeast(0L)
+        val nativeSpan = (piece.sourceEndMs - piece.sourceStartMs).coerceAtLeast(1L)
+        val offsetInPiece = if (piece.isStillImage) {
+            playerPos.coerceIn(0L, piece.timelineSpanMs)
         } else {
-            (playerPosMs / currentSpeed).toLong().coerceAtMost(clip.timelineDurationMs)
+            val rate = piece.speed.coerceAtLeast(0.01f)
+            val sourceOffset = if (piece.isReversed) {
+                (nativeSpan - playerPos).coerceIn(0L, nativeSpan)
+            } else {
+                playerPos.coerceIn(0L, nativeSpan)
+            }
+            (sourceOffset.toFloat() / rate).toLong().coerceIn(0L, piece.timelineSpanMs)
         }
 
-        val globalMs = clip.startTimeOnTrackMs + timelineOffset
+        val globalMs = (elapsedBefore + offsetInPiece).coerceIn(0L, project.totalDurationMs.coerceAtLeast(0L))
         _playheadMs.value = globalMs
+
+        val activeClip = project.findMainClipAt(globalMs) ?: piece.clip
+        liveState.activeClip = activeClip
+        liveState.localClipOffsetMs = (globalMs - activeClip.startTimeOnTrackMs)
+            .coerceIn(0L, activeClip.timelineDurationMs)
+        updateMainVolume(activeClip, liveState.localClipOffsetMs)
+    }
+
+    /** Advances the playhead over an image / frozen frame that the UI renders on top. */
+    private fun advanceHeldStill() {
+        val project = currentProject ?: return
+        stillClockMs += TICK_MS
+        val clip = project.findMainClipAt(stillClockMs)
+        if (clip == null || !(clip.mediaKind == MediaKind.IMAGE || clip.isFrozenFrame)) {
+            // Hand control back to the player exactly where the clock stopped.
+            seekToTimelineMs(stillClockMs)
+            return
+        }
+        _playheadMs.value = stillClockMs
         liveState.activeClip = clip
-        liveState.localClipOffsetMs = timelineOffset
+        liveState.localClipOffsetMs = (stillClockMs - clip.startTimeOnTrackMs)
+            .coerceIn(0L, clip.timelineDurationMs)
+        updateMainVolume(clip, liveState.localClipOffsetMs)
+    }
 
-        // Live speed ramp & audio volume/ducking modulation
-        val normPos = if (clip.timelineDurationMs > 0) {
-            timelineOffset.toFloat() / clip.timelineDurationMs.toFloat()
-        } else 0f
-        val desiredSpeed = if (clip.isFrozenFrame || clip.mediaKind == MediaKind.IMAGE) {
-            1.0f
+    private fun updateMainVolume(clip: TimelineClip, localOffset: Long) {
+        val project = currentProject ?: return
+        val mainTrack = project.trackByType(TrackType.VIDEO_MAIN)
+        val muted = mainTrack?.isMuted == true || clip.isMuted || !clip.hasAudioTrack
+        videoPlayer.volume = if (muted) {
+            0f
         } else {
-            clip.instantaneousSpeedAt(normPos).coerceIn(0.2f, 4.0f)
-        }
-        if (abs(videoPlayer.playbackParameters.speed - desiredSpeed) > 0.04f) {
-            videoPlayer.playbackParameters = PlaybackParameters(desiredSpeed)
-        }
-
-        val mainTrack = proj.trackByType(TrackType.VIDEO_MAIN)
-        val trackMuted = mainTrack?.isMuted == true || clip.isMuted || !clip.hasAudioTrack
-        if (trackMuted) {
-            videoPlayer.volume = 0f
-        } else {
-            val kfVol = KeyframeInterpolator.evaluateClipState(clip, timelineOffset).volume
-            val duck = if (clip.audioDucking) AudioDspEngine.computeDuckingGain(proj, globalMs) else 1f
-            videoPlayer.volume = (kfVol * (mainTrack?.volume ?: 1f) * duck).coerceIn(0f, 1.5f)
+            val kfVolume = KeyframeInterpolator.evaluateClipState(clip, localOffset).volume
+            (kfVolume * (mainTrack?.volume ?: 1f)).coerceIn(0f, 1.5f)
         }
     }
 
+    // ------------------------------------------------------------------ GPU state
+
     /**
-     * Updates [liveState] immediately and rebuilds Media3's VideoGraph ONLY when structural shader
-     * topology changes (clip change, effect added/removed/reordered, or proxy mode toggled).
-     * Returns `true` if any visual parameter changed since the last frame.
+     * Pushes the active clip into [liveState] and rebuilds the VideoGraph only when the shader
+     * *topology* changed. Returns true when a visual parameter changed.
      */
-    private fun applyActiveClipStateAndEffects(forceRebuild: Boolean): Boolean {
-        val proj = currentProject ?: return false
-        val t = _playheadMs.value
-        val activeClip = proj.findMainClipAt(t) ?: return false
-        val localOffset = (t - activeClip.startTimeOnTrackMs).coerceIn(0L, activeClip.timelineDurationMs)
+    private fun applyActiveClipStateAndEffects(): Boolean {
+        val project = currentProject ?: return false
+        val timelineMs = _playheadMs.value
+        val activeClip = project.findMainClipAt(timelineMs) ?: return false
+        val localOffset = (timelineMs - activeClip.startTimeOnTrackMs).coerceIn(0L, activeClip.timelineDurationMs)
 
         liveState.activeClip = activeClip
         liveState.localClipOffsetMs = localOffset
-        updateCustomLutCacheIfNeeded(activeClip.colorGrade.customCubeLutUri, activeClip.colorGrade.lutIntensity)
+        updateCustomLutCache(activeClip.colorGrade.customCubeLutUri)
 
-        val structuralSig = buildString(96) {
-            append(activeClip.id).append('|')
-            append(lowResProxyMode).append('|')
-            append(activeClip.upscaleTargetHeight ?: 0).append('|')
-            for (fx in activeClip.effects) {
-                append(fx.id).append(':').append(fx.type.name).append(',')
-            }
+        val structural = buildString(128) {
+            append(activeClip.id).append('|').append(proxyHeight ?: 0).append('|')
+            append(project.enhancement.enabled).append(':').append(project.enhancement.targetHeight).append('|')
+            append(activeClip.crop.isIdentity).append(activeClip.keyframes.isNotEmpty()).append('|')
+            for (fx in activeClip.effects) append(fx.id).append(':').append(fx.type.name).append(',')
         }
-
-        if (forceRebuild || structuralSig != appliedStructuralFxSignature) {
-            appliedStructuralFxSignature = structuralSig
-            val effects = ClipEffectsFactory.buildLivePreviewVideoEffects(
-                activeClip = activeClip,
-                liveState = liveState,
-                lowResProxyMode = lowResProxyMode
+        if (structural != structuralFxSignature) {
+            structuralFxSignature = structural
+            videoPlayer.setVideoEffects(
+                ClipEffectsFactory.buildLivePreviewVideoEffects(activeClip, liveState, proxyHeight)
             )
-            videoPlayer.setVideoEffects(effects)
         }
 
-        val visualHash = computeVisualHash(activeClip, proj.customColorPresets.size, compareBypass)
-        val changed = visualHash != lastVisualParamSignature
-        lastVisualParamSignature = visualHash
+        _heldStillClip.value =
+            if (activeClip.mediaKind == MediaKind.IMAGE || activeClip.isFrozenFrame) activeClip else null
+
+        val hash = computeVisualHash(activeClip, compareBypass)
+        val changed = hash != lastVisualHash
+        lastVisualHash = hash
         return changed
     }
 
     /**
-     * Pushes the paused decoder frame through the warm OpenGL shader pipeline at up to 30fps
-     * so slider drags on paused video or photo clips show immediate live changes with zero flicker.
+     * Media3 keeps the last decoded frame while paused, so a live slider edit cannot show until the
+     * frame is re-decoded through the (already warm) shader pipeline. Re-seeking the current
+     * position does exactly that, with a debounce so dragging stays smooth.
      */
     private fun requestPausedFrameRefresh() {
         if (pausedRefreshJob?.isActive == true) return
         pausedRefreshJob = scope.launch(Dispatchers.Main) {
-            refreshCurrentPausedFrameNow()
-            delay(33L)
+            delay(FRAME_REFRESH_DEBOUNCE_MS)
+            refreshPausedFrame()
         }
     }
 
-    private fun refreshCurrentPausedFrameNow() {
-        val proj = currentProject ?: return
-        val mainClips = proj.mainVideoClips
-        if (mainClips.isEmpty() || videoPlayer.mediaItemCount == 0) return
-
-        val clamped = _playheadMs.value.coerceIn(0L, proj.totalDurationMs.coerceAtLeast(0L))
-        var targetIndex = mainClips.indexOfFirst { clamped >= it.startTimeOnTrackMs && clamped < it.endTimeOnTrackMs }
-        if (targetIndex < 0) {
-            targetIndex = mainClips.indexOfLast { clamped >= it.startTimeOnTrackMs }.coerceAtLeast(0)
-        }
-        if (targetIndex !in 0 until videoPlayer.mediaItemCount) return
-
-        val clip = mainClips[targetIndex]
+    private fun refreshPausedFrame() {
+        val project = currentProject ?: return
+        if (project.mainVideoClips.isEmpty() || videoPlayer.mediaItemCount == 0) return
+        if (videoPlayer.isPlaying || isUserScrubbing) return
+        val clamped = _playheadMs.value.coerceIn(0L, project.totalDurationMs.coerceAtLeast(0L))
+        val clip = project.findMainClipAt(clamped) ?: return
         val localOffset = (clamped - clip.startTimeOnTrackMs).coerceIn(0L, clip.timelineDurationMs)
-        liveState.activeClip = clip
-        liveState.localClipOffsetMs = localOffset
-
-        val sourcePosInClipMs = if (clip.mediaKind == MediaKind.IMAGE) {
-            localOffset
-        } else if (clip.isFrozenFrame) {
-            0L
-        } else {
-            (clip.mapTimelineOffsetToSourceMs(localOffset) - clip.trimStartMs)
-                .coerceIn(0L, clip.trimmedSourceDurationMs)
-        }
-
-        if (videoPlayer.playbackState == Player.STATE_IDLE) {
-            videoPlayer.prepare()
-        }
-        videoPlayer.seekTo(targetIndex, sourcePosInClipMs)
+        val target = resolvePlaylistPosition(clamped) ?: return
+        if (videoPlayer.playbackState == Player.STATE_IDLE) videoPlayer.prepare()
+        videoPlayer.seekTo(target.first, target.second)
     }
 
-    private fun updateCustomLutCacheIfNeeded(uriStr: String?, intensity: Float) {
-        if (uriStr.isNullOrBlank()) {
+    private fun updateCustomLutCache(uriString: String?) {
+        if (uriString.isNullOrBlank()) {
             liveState.customLutCubeCacheUri = null
             liveState.customLutCubeCache = null
             return
         }
-        if (liveState.customLutCubeCacheUri == uriStr && liveState.customLutCubeCache != null) {
-            return
-        }
+        if (liveState.customLutCubeCacheUri == uriString && liveState.customLutCubeCache != null) return
         runCatching {
-            val u = parseClipUri(uriStr)
-            val text = if (u.scheme == "file" && !u.path.isNullOrBlank()) {
-                File(u.path!!).readText()
+            val uri = parseUri(uriString)
+            val text = if (uri.scheme == "file" && !uri.path.isNullOrBlank()) {
+                File(uri.path!!).readText()
             } else {
-                context.contentResolver.openInputStream(u)?.bufferedReader()?.use { it.readText() }
+                context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
             }
             if (!text.isNullOrBlank()) {
-                liveState.customLutCubeCache = ColorGradingEngine.parseAdobeCubeLut(text, lutIntensity = 1.0f)
-                liveState.customLutCubeCacheUri = uriStr
+                liveState.customLutCubeCache = ColorGradingEngine.parseAdobeCubeLut(text, lutIntensity = 1f)
+                liveState.customLutCubeCacheUri = uriString
             }
         }
     }
 
-    private fun computeVisualHash(clip: TimelineClip, presetCount: Int, bypass: Boolean): Int {
+    private fun computeVisualHash(clip: TimelineClip, bypass: Boolean): Int {
         var h = clip.id.hashCode()
         h = 31 * h + clip.colorGrade.hashCode()
         h = 31 * h + clip.effects.hashCode()
         h = 31 * h + clip.transform.hashCode()
         h = 31 * h + clip.crop.hashCode()
+        h = 31 * h + clip.chromaKey.hashCode()
         h = 31 * h + clip.keyframes.hashCode()
         h = 31 * h + (clip.transitionIn?.hashCode() ?: 0)
-        h = 31 * h + (clip.transitionOut?.hashCode() ?: 0)
-        h = 31 * h + presetCount
         h = 31 * h + bypass.hashCode()
         return h
     }
 
-    private fun syncAuxAudioPlayback(forceSeek: Boolean) {
-        val proj = currentProject ?: return
-        val t = _playheadMs.value
-        val activeAudioPair = proj.tracks
-            .filter { it.type.isAudioTrack && !it.isMuted }
-            .flatMap { track -> track.clips.map { track to it } }
-            .firstOrNull { (_, clip) -> !clip.isMuted && t in clip.startTimeOnTrackMs until clip.endTimeOnTrackMs }
+    // ------------------------------------------------------------------ frame stepping
 
-        if (activeAudioPair == null) {
+    /** Moves the playhead by exactly one project frame and refreshes the preview. */
+    fun stepFrame(fps: Int, direction: Int): Long {
+        val project = currentProject ?: return _playheadMs.value
+        val safeFps = fps.coerceIn(1, 120)
+        val frameMs = (1000.0 / safeFps).toLong().coerceAtLeast(1L)
+        val target = (_playheadMs.value + frameMs * direction.toLong())
+            .coerceIn(0L, project.totalDurationMs.coerceAtLeast(0L))
+        pause()
+        return seekToTimelineMs(target)
+    }
+
+    // ------------------------------------------------------------------ auxiliary audio
+
+    /**
+     * Plays every audio clip under the playhead (music + voiceover + SFX), keeping the first active
+     * clip sample-locked to the main timeline. Additional simultaneous tracks are mixed by the
+     * export DSP chain; preview follows the playhead so switching tracks never pops.
+     */
+    private fun syncAuxPlayback(forceSeek: Boolean) {
+        val project = currentProject ?: return
+        val timelineMs = _playheadMs.value
+        val active = project.tracks
+            .filter { it.type.isAudioTrack && !it.isMuted && !it.isHidden }
+            .flatMap { track ->
+                track.clips
+                    .filter { timelineMs in it.startTimeOnTrackMs until it.endTimeOnTrackMs }
+                    .map { track to it }
+            }
+
+        if (active.isEmpty()) {
             activeAuxClipId = null
             if (auxAudioPlayer.isPlaying) auxAudioPlayer.pause()
             return
         }
 
-        val (track, audioClip) = activeAudioPair
-        val offsetInAudioMs = (t - audioClip.startTimeOnTrackMs + audioClip.trimStartMs)
-            .coerceIn(0L, audioClip.effectiveTrimEndMs)
+        val (track, clip) = active.first()
+        val localMs = (timelineMs - clip.startTimeOnTrackMs).coerceAtLeast(0L)
+        val offsetInClip = clip.mapTimelineOffsetToSourceMs(
+            localMs.coerceIn(0L, clip.timelineDurationMs)
+        )
 
-        if (activeAuxClipId != audioClip.id) {
-            activeAuxClipId = audioClip.id
-            auxAudioPlayer.setMediaItem(MediaItem.fromUri(parseClipUri(audioClip.sourceUri)))
+        if (activeAuxClipId != clip.id) {
+            activeAuxClipId = clip.id
+            auxAudioPlayer.setMediaItem(MediaItem.fromUri(parseUri(clip.sourceUri)))
             auxAudioPlayer.prepare()
-            auxAudioPlayer.seekTo(offsetInAudioMs)
-        } else if (forceSeek || abs(auxAudioPlayer.currentPosition - offsetInAudioMs) > 250L) {
-            auxAudioPlayer.seekTo(offsetInAudioMs)
+            auxAudioPlayer.seekTo(offsetInClip)
+        } else if (forceSeek || kotlin.math.abs(auxAudioPlayer.currentPosition - offsetInClip) > 260L) {
+            auxAudioPlayer.seekTo(offsetInClip)
         }
 
-        val localMs = (t - audioClip.startTimeOnTrackMs).coerceAtLeast(0L)
-        val kfVol = KeyframeInterpolator.evaluateClipState(audioClip, localMs).volume
-        val duck = if (audioClip.audioDucking) AudioDspEngine.computeDuckingGain(proj, t) else 1f
-        auxAudioPlayer.volume = (kfVol * track.volume * duck).coerceIn(0f, 1.5f)
+        val kfVolume = KeyframeInterpolator.evaluateClipState(clip, localMs).volume
+        val duck = if (clip.audioDucking) AudioDspEngine.computeDuckingGain(project, timelineMs) else 1f
+        auxAudioPlayer.volume = (kfVolume * track.volume * duck).coerceIn(0f, 1.5f)
 
-        if (videoPlayer.isPlaying && !auxAudioPlayer.isPlaying) {
-            auxAudioPlayer.play()
-        } else if (!videoPlayer.isPlaying && auxAudioPlayer.isPlaying) {
+        if (videoPlayer.isPlaying) {
+            if (!auxAudioPlayer.isPlaying) auxAudioPlayer.play()
+        } else if (auxAudioPlayer.isPlaying) {
             auxAudioPlayer.pause()
         }
     }
 
-    private fun parseClipUri(uriString: String): Uri {
-        return if (uriString.startsWith("/")) {
-            Uri.fromFile(File(uriString))
-        } else {
-            Uri.parse(uriString)
-        }
-    }
+    private fun parseUri(uriString: String): Uri =
+        if (uriString.startsWith("/")) Uri.fromFile(File(uriString)) else Uri.parse(uriString)
 
+    /** Releases both players; safe to call twice (lifecycle + ViewModel clear). */
     fun release() {
         stopTicker()
         pausedRefreshJob?.cancel()
-        videoPlayer.release()
-        auxAudioPlayer.release()
+        frameSeekJob?.cancel()
+        runCatching { videoPlayer.release() }
+        runCatching { auxAudioPlayer.release() }
+    }
+
+    companion object {
+        /** 24 ms keeps the playhead within one frame at 30 fps without burning CPU. */
+        const val TICK_MS = 24L
+        const val FRAME_REFRESH_DEBOUNCE_MS = 16L
     }
 }

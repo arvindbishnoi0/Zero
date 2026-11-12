@@ -12,8 +12,6 @@ import com.vibecut.pro.data.repository.ProjectSummary
 import com.vibecut.pro.engine.model.AspectRatioPreset
 import com.vibecut.pro.engine.model.MediaKind
 import com.vibecut.pro.engine.model.TrackType
-import com.vibecut.pro.engine.templates.ProjectTemplate
-import com.vibecut.pro.engine.templates.TemplateCatalog
 import com.vibecut.pro.engine.timeline.ImportedMediaSource
 import com.vibecut.pro.engine.timeline.TimelineEngine
 import com.vibecut.pro.media.export.VibeCutExportEngine
@@ -50,9 +48,6 @@ class HomeViewModel @Inject constructor(
     val projects: StateFlow<List<ProjectSummary>> = projectRepository.projectSummariesFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    val templates: StateFlow<List<ProjectTemplate>> = projectRepository.allTemplatesFlow
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), TemplateCatalog.builtInTemplates)
-
     val preferences: StateFlow<StudioPreferences> = preferencesRepository.preferencesFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), StudioPreferences())
 
@@ -82,9 +77,7 @@ class HomeViewModel @Inject constructor(
     }
 
     fun completeOnboarding() {
-        viewModelScope.launch {
-            preferencesRepository.setOnboardingCompleted(true)
-        }
+        viewModelScope.launch { preferencesRepository.setOnboardingCompleted(true) }
     }
 
     fun createEmptyProject(
@@ -93,7 +86,7 @@ class HomeViewModel @Inject constructor(
         onCreated: (String) -> Unit
     ) {
         viewModelScope.launch {
-            val p = projectRepository.createNewProject(title, aspectRatio)
+            val p = projectRepository.createNewProject(title.ifBlank { "Untitled Edit" }, aspectRatio)
             onCreated(p.id)
         }
     }
@@ -106,8 +99,7 @@ class HomeViewModel @Inject constructor(
     ) {
         viewModelScope.launch {
             if (uris.isEmpty()) {
-                val p = projectRepository.createNewProject(title, aspectRatio)
-                onCreated(p.id)
+                createEmptyProject(title, aspectRatio, onCreated)
                 return@launch
             }
             _isBusy.value = true
@@ -117,15 +109,14 @@ class HomeViewModel @Inject constructor(
                     _statusBanner.value = batch.failures.firstOrNull() ?: "Could not load selected media"
                     return@launch
                 }
-                var project = projectRepository.createNewProject(title, aspectRatio)
+                var project = projectRepository.createNewProject(title.ifBlank { "Untitled Edit" }, aspectRatio)
                 val visualSources = batch.imported.filter { it.mediaKind != MediaKind.AUDIO }
                 val audioSources = batch.imported.filter { it.mediaKind == MediaKind.AUDIO }
 
                 if (visualSources.isNotEmpty()) {
                     project = TimelineEngine.importMediaClips(project, visualSources, TrackType.VIDEO_MAIN)
                 } else {
-                    // If user started a project from an audio track alone, generate a sleek studio backdrop clip
-                    val dims = aspectRatio.computeCodecSafeDimensions(720)
+                    val dims = AspectRatioPreset.dimensionsForProject(aspectRatio, 720, aspectRatio.ratioFloat)
                     val canvasClip = demoClipGenerator.generateStudioCanvasClip(
                         title = "Audio Backdrop",
                         width = dims.first,
@@ -158,7 +149,7 @@ class HomeViewModel @Inject constructor(
         viewModelScope.launch {
             _isBusy.value = true
             try {
-                val dims = aspectRatio.computeCodecSafeDimensions(720)
+                val dims = AspectRatioPreset.dimensionsForProject(aspectRatio, 720, aspectRatio.ratioFloat)
                 val canvasClip = demoClipGenerator.generateStudioCanvasClip(
                     title = title.ifBlank { "Studio Canvas" },
                     primaryColorArgb = primaryArgb,
@@ -187,43 +178,7 @@ class HomeViewModel @Inject constructor(
                 val demoClips = demoClipGenerator.generateSampleVideoClips()
                 var project = projectRepository.createNewProject("VibeCut Demo Reel", aspectRatio)
                 project = TimelineEngine.importMediaClips(project, demoClips, TrackType.VIDEO_MAIN)
-                projectRepository.saveProject(project, "Generated 3 H.264 sample clips")
-                onCreated(project.id)
-            } finally {
-                _isBusy.value = false
-            }
-        }
-    }
-
-    fun applyMarketplaceTemplate(
-        template: ProjectTemplate,
-        selectedUris: List<Uri>,
-        headline: String,
-        subtitle: String,
-        musicUri: Uri?,
-        onCreated: (String) -> Unit
-    ) {
-        viewModelScope.launch {
-            _isBusy.value = true
-            try {
-                val sources = if (selectedUris.isNotEmpty()) {
-                    mediaSupportManager.importMediaBatch(selectedUris).imported
-                        .filter { it.mediaKind != MediaKind.AUDIO }
-                        .ifEmpty { demoClipGenerator.generateSampleVideoClips() }
-                } else {
-                    demoClipGenerator.generateSampleVideoClips()
-                }
-                val musicSource = musicUri?.let {
-                    mediaSupportManager.importSingleUri(it, forceAudio = true).getOrNull()
-                }
-                val project = TemplateCatalog.applyTemplate(
-                    template = template,
-                    sources = sources,
-                    customHeadline = headline,
-                    customSubtitle = subtitle,
-                    musicSource = musicSource
-                )
-                projectRepository.saveProject(project, "Applied template '${template.name}'")
+                projectRepository.saveProject(project, "Generated ${demoClips.size} sample clips")
                 onCreated(project.id)
             } finally {
                 _isBusy.value = false
@@ -232,9 +187,7 @@ class HomeViewModel @Inject constructor(
     }
 
     fun renameProject(projectId: String, newTitle: String) {
-        viewModelScope.launch {
-            projectRepository.renameProject(projectId, newTitle)
-        }
+        viewModelScope.launch { projectRepository.renameProject(projectId, newTitle) }
     }
 
     fun duplicateProject(projectId: String) {
@@ -245,15 +198,7 @@ class HomeViewModel @Inject constructor(
     }
 
     fun deleteProject(projectId: String) {
-        viewModelScope.launch {
-            projectRepository.deleteProject(projectId)
-        }
-    }
-
-    fun deleteSavedTemplate(templateId: String) {
-        viewModelScope.launch {
-            projectRepository.deleteCustomTemplate(templateId)
-        }
+        viewModelScope.launch { projectRepository.deleteProject(projectId) }
     }
 
     fun observeRevisions(projectId: String): Flow<List<ProjectRevisionEntity>> =
@@ -296,17 +241,8 @@ class HomeViewModel @Inject constructor(
         viewModelScope.launch { preferencesRepository.setDefaultExport(resName, fpsName) }
     }
 
-    fun updateExternalAiSettings(endpoint: String, apiKey: String) {
-        viewModelScope.launch {
-            preferencesRepository.setExternalAiConfig(endpoint, apiKey)
-            _statusBanner.value = "Saved AI Integration settings"
-        }
-    }
-
     fun refreshCacheSize() {
-        viewModelScope.launch {
-            _cacheSizeBytes.value = projectRepository.computeCacheBytes()
-        }
+        viewModelScope.launch { _cacheSizeBytes.value = projectRepository.computeCacheBytes() }
     }
 
     fun clearCache() {

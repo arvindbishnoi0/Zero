@@ -1,8 +1,8 @@
-name: VibeCut Pro Android Build & Tests
+name: ZERO Android Build & Tests
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "arena/**" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
@@ -10,6 +10,7 @@ on:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -23,21 +24,47 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Run Unit Tests & Assemble Debug APK
+      - name: Generate fallback debug keystore
         run: |
-          set +e
-          ./gradlew :core:engine:test testDebugUnitTest assembleDebug --stacktrace > /tmp/gradle-build.log 2>&1
-          STATUS=$?
-          cat /tmp/gradle-build.log
-          if [ $STATUS -ne 0 ]; then
-            grep -E "^e: |FAILURE:|What went wrong:|^\* |^  > |error: |Execution failed" /tmp/gradle-build.log | head -n 40 | while IFS= read -r line; do
-              echo "::error::$line"
-            done
-            exit $STATUS
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair -v \
+              -keystore "$HOME/.android/debug.keystore" \
+              -storepass android -keypass android \
+              -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
           fi
 
-      - name: Upload VibeCut Pro Debug APK
+      - name: Engine unit tests
+        run: ./gradlew :core:engine:test --stacktrace
+
+      - name: App unit tests
+        run: ./gradlew :app:testDebugUnitTest --stacktrace
+
+      - name: Assemble debug + release APK
+        run: ./gradlew :app:assembleDebug :app:assembleRelease --stacktrace
+
+      - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: VibeCutPro-debug-apk
+          name: ZERO-debug-apk
           path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZERO-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            app/build/reports/tests/**
+            core/engine/build/reports/tests/**
+          if-no-files-found: ignore

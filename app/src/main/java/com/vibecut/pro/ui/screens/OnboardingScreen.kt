@@ -7,7 +7,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.MovieFilter
 import androidx.compose.material.icons.filled.Tune
@@ -52,10 +51,10 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                 accent = NeonViolet
             ),
             OnboardingPage(
-                icon = Icons.Default.AutoAwesome,
-                badge = "LOCAL ON-DEVICE AI",
-                title = "AI Vision, Beat Sync & Hindi/EN Captions",
-                description = "ML Kit Face & Subject Tracking, Auto-Reframe, Scene Detection, PCM Beat Sync & Speech-to-Text captions—100% local, zero login required.",
+                icon = Icons.Default.Tune,
+                badge = "REAL BEAT SYNC",
+                title = "Music Sync, Captions & Audio Mixing",
+                description = "On-device beat detection cuts to the music, per-clip mixing with fades, noise reduction, voice clarity and .srt captions — all local, no login.",
                 accent = KeyframeGold
             ),
             OnboardingPage(
@@ -180,7 +179,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
             )
         ) {
             Text(
-                text = if (pageIndex < pages.lastIndex) "Continue" else "Enter VibeCut Studio",
+                text = if (pageIndex < pages.lastIndex) "Continue" else "Open ZERO Studio",
                 fontWeight = FontWeight.Bold,
                 fontSize = 15.sp
             )
