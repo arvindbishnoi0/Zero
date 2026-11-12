@@ -391,7 +391,7 @@ class EditorPreviewController(
                 context.contentResolver.openInputStream(u)?.bufferedReader()?.use { it.readText() }
             }
             if (!text.isNullOrBlank()) {
-                liveState.customLutCubeCache = ColorGradingEngine.parseAdobeCubeLut(text, intensity = 1.0f)
+                liveState.customLutCubeCache = ColorGradingEngine.parseAdobeCubeLut(text, lutIntensity = 1.0f)
                 liveState.customLutCubeCacheUri = uriStr
             }
         }
