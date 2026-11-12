@@ -30,7 +30,13 @@ jobs:
           java-version: '17'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        run: |
+          SDK_ROOT="$ANDROID_SDK_ROOT"
+          if [ -z "$SDK_ROOT" ]; then SDK_ROOT="$ANDROID_HOME"; fi
+          echo "Android SDK root: $SDK_ROOT"
+          echo "Build tools:"; ls "$SDK_ROOT/build-tools" || true
+          echo "Platforms:"; ls "$SDK_ROOT/platforms" || true
+          yes | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
