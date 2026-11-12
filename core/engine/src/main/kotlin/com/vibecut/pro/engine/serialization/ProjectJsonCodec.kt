@@ -35,7 +35,7 @@ object ProjectJsonCodec {
     )
 
     fun decodeProject(json: String): Project {
-        val root = MiniJson.parseObject(json)
+        val root = MiniJson.parseObject(json).asJsonObj()
         val tracks = root.list("tracks").map { decodeTrack(it.asObj()) }
         return Project(
             id = root.str("id", Project().id),
@@ -539,7 +539,6 @@ object ProjectJsonCodec {
 
     // ------------------------------------------------------------------ mini JSON
 
-    @PublishedApi
     internal class JsonObj(val map: Map<String, Any?>) {
         fun str(k: String, def: String): String = (map[k] as? String) ?: def
         fun strOrNull(k: String): String? = map[k] as? String
@@ -555,7 +554,6 @@ object ProjectJsonCodec {
     }
 
     @Suppress("UNCHECKED_CAST")
-    @PublishedApi
     internal fun Any?.asObj(): JsonObj = JsonObj((this as? Map<String, Any?>) ?: emptyMap())
 }
 
@@ -563,6 +561,9 @@ object ProjectJsonCodec {
  * Minimal JSON reader/writer shared by the project codec and the preset store.
  * Handles only what ZERO serializes: objects, arrays, strings, numbers, booleans, null.
  */
+/** Wraps a parsed JSON object in the type-safe reader used by the project codec. */
+internal fun Map<String, Any?>.asJsonObj(): ProjectJsonCodec.JsonObj = ProjectJsonCodec.JsonObj(this)
+
 object MiniJson {
 
     fun stringify(value: Any?): String {
