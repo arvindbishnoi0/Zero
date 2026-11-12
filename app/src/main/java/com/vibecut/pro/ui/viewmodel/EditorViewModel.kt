@@ -27,6 +27,7 @@ import com.vibecut.pro.media.sample.DemoClipGenerator
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
@@ -344,7 +345,7 @@ class EditorViewModel @Inject constructor(
         applyMutation("Preview Quality") { it.copy(previewQuality = quality) }
     }
 
-    fun setProjectBackgroundColor(argb: Int) {
+    fun setProjectBackgroundColor(argb: Long) {
         applyCoalescedMutation("bg_color", "Canvas Color") { it.copy(backgroundColorArgb = argb) }
     }
 
@@ -500,7 +501,7 @@ class EditorViewModel @Inject constructor(
                 durationMs = durationMs
             )
             applyMutation("Add '$title' Card") { proj ->
-                TimelineEngine.importMediaClips(proj, listOf(canvasClip), TrackType.VIDEO_MAIN, project.totalDurationMs)
+                TimelineEngine.importMediaClips(proj, listOf(canvasClip), TrackType.VIDEO_MAIN, proj.totalDurationMs)
             }
             saveImmediately()
             notifyToast("Added '$title' card")
@@ -681,10 +682,25 @@ class EditorViewModel @Inject constructor(
         }
     }
 
-    fun updateSelectedSpeed(speed: Float, curvePoints: List<SpeedPoint> = emptyList()) {
+    /**
+     * Sets the constant speed of the selected clip, or — when [curvePreset] is supplied — installs
+     * that ramp preset (its default points) on top of it. Passing `null` keeps whatever ramp the
+     * clip already has, so dragging the constant-speed slider never silently drops a ramp.
+     */
+    fun updateSelectedSpeed(
+        speed: Float,
+        curvePreset: SpeedCurvePreset? = null,
+        curvePoints: List<SpeedPoint> = emptyList()
+    ) {
         val clip = targetClip() ?: return
+        val nextPreset = curvePreset ?: clip.speedCurvePreset
+        val nextPoints = if (curvePreset != null) {
+            curvePoints.ifEmpty { curvePreset.defaultPoints }
+        } else {
+            clip.speedCurvePoints
+        }
         applyCoalescedMutation("speed_${clip.id}", "Speed", newSelectedClipId = clip.id) {
-            TimelineEngine.setClipSpeed(it, clip.id, speed, curvePoints)
+            TimelineEngine.setClipSpeed(it, clip.id, speed, nextPreset, nextPoints)
         }
     }
 
@@ -1007,8 +1023,8 @@ class EditorViewModel @Inject constructor(
                 notifyToast("Recording too short")
             }
         } else {
-            val started = voiceoverRecorder.startRecording()
-            if (!started) {
+            val startedFile = voiceoverRecorder.startRecording()
+            if (startedFile == null) {
                 notifyToast("Microphone permission required")
                 return
             }
@@ -1032,16 +1048,16 @@ class EditorViewModel @Inject constructor(
             }
             val source = ImportedMediaSource(
                 uri = path.absolutePath,
-                displayName = preset.displayName,
+                displayName = preset.title,
                 mediaKind = MediaKind.GENERATED_SFX,
-                durationMs = 2_000L,
+                durationMs = preset.durationMs.toLong(),
                 mimeType = "audio/wav",
                 hasAudioTrack = true
             )
-            applyMutation("Add ${preset.displayName}") {
+            applyMutation("Add ${preset.title}") {
                 TimelineEngine.importMediaClips(it, listOf(source), TrackType.AUDIO_SFX, playheadMs.value)
             }
-            notifyToast("${preset.displayName} added")
+            notifyToast("${preset.title} added")
         }
     }
 

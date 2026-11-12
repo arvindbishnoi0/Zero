@@ -408,10 +408,7 @@ private fun SpeedSheet(clip: TimelineClip?, playheadMs: Long, viewModel: EditorV
                         label = preset.label,
                         selected = clip.speedCurvePreset == preset,
                         onClick = {
-                            viewModel.updateSelectedSpeed(
-                                clip.clampedSpeed,
-                                preset.defaultPoints
-                            )
+                            viewModel.updateSelectedSpeed(clip.clampedSpeed, preset)
                         }
                     )
                 }
