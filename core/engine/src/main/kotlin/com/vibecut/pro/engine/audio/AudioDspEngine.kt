@@ -174,7 +174,7 @@ object AudioDspEngine {
                 val targetSourceSpan = min(maxAvailable, (desiredDurMs * clip.speed).roundToLong())
                 clip.copy(
                     trimEndMs = clip.trimStartMs + targetSourceSpan,
-                    transitionIn = if (clipIdx > 0) ClipTransition(TransitionType.FLASH, 220L) else null
+                    transitionIn = if (clipIdx > 0) ClipTransition(TransitionType.FADE, 220L) else null
                 )
             } else {
                 clip

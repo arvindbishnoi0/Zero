@@ -105,14 +105,16 @@ class TimelineGestureLogicTest {
         val pipTrack = TimelineEngine.addTrack(project, TrackType.VIDEO_PIP)
             .trackByType(TrackType.VIDEO_PIP)!!
         val withPip = TimelineEngine.importMediaClips(
-            project, listOf(ImportedMediaSource("file:///o.mp4", "Overlay", MediaKind.VIDEO, 2_000L)),
-            TrackType.VIDEO_PIP, 1_000L
+            project,
+            listOf(ImportedMediaSource("file:///o.mp4", "Overlay", MediaKind.VIDEO, 2_000L)),
+            TrackType.VIDEO_PIP,
+            insertAtPlayheadMs = 1_000L
         )
         val overlay = withPip.trackByType(TrackType.VIDEO_PIP)!!.clips.first()
-        // Snapping (120 ms window) should pull 1_040 ms onto the main clip boundary at 5_000 ms…
-        val snapped = TimelineEngine.moveClipToTimestamp(withPip, overlay.id, 1_040L)
-        assertEquals(1_040L, snapped.findClip(overlay.id)!!.startTimeOnTrackMs)
-        // …while a start close to an existing anchor snaps exactly onto it.
+        // A drag that lands away from any edge keeps the exact requested position…
+        val free = TimelineEngine.moveClipToTimestamp(withPip, overlay.id, 1_040L)
+        assertEquals(1_040L, free.findClip(overlay.id)!!.startTimeOnTrackMs)
+        // …while a drag near a clip boundary (120 ms snap window) locks onto it.
         val snappedToEdge = TimelineEngine.moveClipToTimestamp(withPip, overlay.id, 4_930L)
         assertEquals(5_000L, snappedToEdge.findClip(overlay.id)!!.startTimeOnTrackMs)
         // Snapping never moves a free-track clip through another track or off the timeline.

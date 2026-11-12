@@ -539,7 +539,8 @@ object ProjectJsonCodec {
 
     // ------------------------------------------------------------------ mini JSON
 
-    private class JsonObj(val map: Map<String, Any?>) {
+    @PublishedApi
+    internal class JsonObj(val map: Map<String, Any?>) {
         fun str(k: String, def: String): String = (map[k] as? String) ?: def
         fun strOrNull(k: String): String? = map[k] as? String
         fun int(k: String, def: Int): Int = (map[k] as? Number)?.toInt() ?: def
@@ -547,14 +548,15 @@ object ProjectJsonCodec {
         fun float(k: String, def: Float): Float = (map[k] as? Number)?.toFloat() ?: def
         fun bool(k: String, def: Boolean): Boolean = (map[k] as? Boolean) ?: def
         fun list(k: String): List<Any?> = (map[k] as? List<*>) ?: emptyList()
-        fun objOrNull(k: String): JsonObj? = (map[k] as? Map<*, *>)?.let {
+        fun objOrNull(k: String): JsonObj? = (map[k] as? Map<*, *>)?.let { raw ->
             @Suppress("UNCHECKED_CAST")
-            JsonObj(it as Map<String, Any?>)
+            JsonObj(raw as Map<String, Any?>)
         }
     }
 
     @Suppress("UNCHECKED_CAST")
-    private fun Any?.asObj(): JsonObj = JsonObj((this as? Map<String, Any?>) ?: emptyMap())
+    @PublishedApi
+    internal fun Any?.asObj(): JsonObj = JsonObj((this as? Map<String, Any?>) ?: emptyMap())
 }
 
 /**
