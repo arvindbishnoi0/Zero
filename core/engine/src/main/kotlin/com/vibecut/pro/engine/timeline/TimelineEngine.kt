@@ -29,17 +29,29 @@ object TimelineEngine {
 
         val addedClips = items.map { src ->
             val safeDuration = max(MIN_CLIP_DURATION_MS, src.durationMs)
+            val defaultTransform = if (targetTrack.type == TrackType.VIDEO_PIP) {
+                ClipTransform(positionX = 0.25f, positionY = 0.25f, scaleX = 0.42f, scaleY = 0.42f)
+            } else {
+                ClipTransform()
+            }
             val clip = TimelineClip(
                 id = UUID.randomUUID().toString(),
                 trackId = targetTrack.id,
                 sourceUri = src.uri,
                 sourceName = src.displayName,
                 mediaKind = src.mediaKind,
-                sourceDurationMs = safeDuration,
+                sourceDurationMs = if (src.mediaKind == MediaKind.IMAGE) max(30_000L, safeDuration) else safeDuration,
                 startTimeOnTrackMs = cursorMs,
                 trimStartMs = 0L,
                 trimEndMs = safeDuration,
-                waveformPeaks = src.waveformPeaks
+                transform = defaultTransform,
+                waveformPeaks = src.waveformPeaks,
+                hasAudioTrack = src.hasAudioTrack && src.mediaKind != MediaKind.IMAGE,
+                sourceWidth = src.width,
+                sourceHeight = src.height,
+                rotationDegreesMeta = src.rotationDegreesMeta,
+                mimeType = src.mimeType,
+                thumbnailUri = src.thumbnailUri
             )
             cursorMs += clip.timelineDurationMs
             clip
@@ -54,6 +66,13 @@ object TimelineEngine {
             }
         }
     }
+
+    fun setProjectAspectRatio(project: Project, aspectRatio: AspectRatioPreset): Project =
+        project.copy(
+            aspectRatio = aspectRatio,
+            updatedAtMs = System.currentTimeMillis(),
+            revision = project.revision + 1
+        )
 
     fun trimClip(
         project: Project,
@@ -148,17 +167,14 @@ object TimelineEngine {
         val clampedEnd = min(clip.endTimeOnTrackMs, cutEndMs)
         if (clampedEnd <= clampedStart + 40L) return project
 
-        // Case 1: Cuts from the start of the clip
         if (clampedStart <= clip.startTimeOnTrackMs + MIN_CLIP_DURATION_MS) {
             val newTrimStart = mapTimelineOffsetToSourceMs(clip, clampedEnd - clip.startTimeOnTrackMs)
             return trimClip(project, clipId, newTrimStart, clip.trimEndMs)
         }
-        // Case 2: Cuts through the end of the clip
         if (clampedEnd >= clip.endTimeOnTrackMs - MIN_CLIP_DURATION_MS) {
             val newTrimEnd = mapTimelineOffsetToSourceMs(clip, clampedStart - clip.startTimeOnTrackMs)
             return trimClip(project, clipId, clip.trimStartMs, newTrimEnd)
         }
-        // Case 3: Excises middle section -> produces left + right segments
         val srcCutStart = mapTimelineOffsetToSourceMs(clip, clampedStart - clip.startTimeOnTrackMs)
         val srcCutEnd = mapTimelineOffsetToSourceMs(clip, clampedEnd - clip.startTimeOnTrackMs)
 
@@ -249,7 +265,6 @@ object TimelineEngine {
         val track = project.findTrackForClip(clipId) ?: return project
         if (track.isLocked) return project
         if (track.type == TrackType.VIDEO_MAIN && project.magneticTimeline) {
-            // On a magnetic main track, moving translates to index reordering
             val sorted = track.clips.sortedBy { it.startTimeOnTrackMs }
             val currentIdx = sorted.indexOfFirst { it.id == clipId }
             if (currentIdx < 0) return project
@@ -292,10 +307,6 @@ object TimelineEngine {
         return if (abs(nearest - candidateMs) <= thresholdMs) max(0L, nearest) else candidateMs
     }
 
-    /**
-     * Merges adjacent clips. If they share the same sourceUri and have contiguous trims, heals them
-     * into a single continuous clip; otherwise packs them seamlessly onto the track with zero gap.
-     */
     fun mergeClips(project: Project, clipIds: List<String>): Project {
         if (clipIds.size < 2) return project
         val firstTrack = project.findTrackForClip(clipIds.first()) ?: return project
@@ -324,7 +335,6 @@ object TimelineEngine {
                 remaining.add(firstIdx.coerceIn(0, remaining.size), mergedClip)
                 maybeMagneticReflow(project, t, remaining)
             } else {
-                // Pack selected clips back-to-back starting at the first selected clip's start
                 var cursor = selected.first().startTimeOnTrackMs
                 val packedIds = selected.map { it.id }.toSet()
                 val packed = selected.mapIndexed { i, c ->
@@ -414,9 +424,6 @@ object TimelineEngine {
         }
     }
 
-    /**
-     * Inserts a Freeze Frame segment of [freezeDurationMs] at [playheadMs].
-     */
     fun insertFreezeFrame(
         project: Project,
         clipId: String,
@@ -426,7 +433,7 @@ object TimelineEngine {
         val track = project.findTrackForClip(clipId) ?: return project
         if (track.isLocked) return project
         val clip = track.clips.firstOrNull { it.id == clipId } ?: return project
-        if (clip.mediaKind != MediaKind.VIDEO) return project
+        if (clip.mediaKind != MediaKind.VIDEO && clip.mediaKind != MediaKind.IMAGE) return project
 
         val clampedOffset = (playheadMs - clip.startTimeOnTrackMs)
             .coerceIn(0L, clip.timelineDurationMs)
@@ -437,19 +444,25 @@ object TimelineEngine {
             trackId = track.id,
             sourceUri = clip.sourceUri,
             sourceName = "${clip.sourceName} (Freeze)",
-            mediaKind = MediaKind.VIDEO,
+            mediaKind = clip.mediaKind,
             sourceDurationMs = freezeDurationMs,
             startTimeOnTrackMs = clip.startTimeOnTrackMs + clampedOffset,
             trimStartMs = 0L,
             trimEndMs = freezeDurationMs,
-            isFrozenFrame = true,
+            isFrozenFrame = clip.mediaKind == MediaKind.VIDEO,
             freezeFrameSourceMs = freezeSourceMs,
             crop = clip.crop,
             transform = clip.transform,
             effects = clip.effects.map { it.copy(id = UUID.randomUUID().toString()) },
             colorGrade = clip.colorGrade,
             volume = 0f,
-            isMuted = true
+            isMuted = true,
+            hasAudioTrack = false,
+            sourceWidth = clip.sourceWidth,
+            sourceHeight = clip.sourceHeight,
+            rotationDegreesMeta = clip.rotationDegreesMeta,
+            mimeType = clip.mimeType,
+            thumbnailUri = clip.thumbnailUri
         )
 
         return updateTrack(project, track.id) { t ->
@@ -527,13 +540,49 @@ object TimelineEngine {
             clip.copy(effects = next)
         }
 
+    fun reorderEffect(project: Project, clipId: String, effectId: String, direction: Int): Project =
+        updateClip(project, clipId) { clip ->
+            val idx = clip.effects.indexOfFirst { it.id == effectId }
+            val targetIdx = idx + direction
+            if (idx < 0 || targetIdx !in clip.effects.indices) return@updateClip clip
+            val mutable = clip.effects.toMutableList()
+            val moved = mutable.removeAt(idx)
+            mutable.add(targetIdx, moved)
+            clip.copy(effects = mutable)
+        }
+
     fun removeEffect(project: Project, clipId: String, effectId: String): Project =
         updateClip(project, clipId) { clip ->
             clip.copy(effects = clip.effects.filterNot { it.id == effectId })
         }
 
+    fun clearClipEffects(project: Project, clipId: String): Project =
+        updateClip(project, clipId) { clip ->
+            clip.copy(effects = emptyList())
+        }
+
+    fun applyEffectsToAllMainClips(project: Project, effects: List<AppliedEffect>): Project {
+        val mainTrack = project.tracks.firstOrNull { it.type == TrackType.VIDEO_MAIN } ?: return project
+        if (mainTrack.isLocked) return project
+        return updateTrack(project, mainTrack.id) { t ->
+            t.copy(
+                clips = t.clips.map { clip ->
+                    clip.copy(effects = effects.map { it.copy(id = UUID.randomUUID().toString()) })
+                }
+            )
+        }
+    }
+
     fun setColorGrade(project: Project, clipId: String, grade: ColorGradeConfig): Project =
         updateClip(project, clipId) { clip -> clip.copy(colorGrade = grade) }
+
+    fun applyColorGradeToAllMainClips(project: Project, grade: ColorGradeConfig): Project {
+        val mainTrack = project.tracks.firstOrNull { it.type == TrackType.VIDEO_MAIN } ?: return project
+        if (mainTrack.isLocked) return project
+        return updateTrack(project, mainTrack.id) { t ->
+            t.copy(clips = t.clips.map { it.copy(colorGrade = grade) })
+        }
+    }
 
     fun setClipTransition(
         project: Project,
@@ -567,7 +616,6 @@ object TimelineEngine {
                 timeOffsetMs = clampedOffset,
                 value = keyframe.value.coerceIn(keyframe.property.minValue, keyframe.property.maxValue)
             )
-            // Replace if same property within 40ms of existing keyframe
             val filtered = clip.keyframes.filterNot {
                 it.id == normalized.id ||
                     (it.property == normalized.property && abs(it.timeOffsetMs - clampedOffset) <= 40L)
@@ -599,7 +647,8 @@ object TimelineEngine {
             startTimeOnTrackMs = max(0L, startMs),
             trimStartMs = 0L,
             trimEndMs = safeDuration,
-            textSpec = textSpec
+            textSpec = textSpec,
+            hasAudioTrack = false
         )
         return updateTrack(project, textTrack.id) { t ->
             t.copy(clips = (t.clips + clip).sortedBy { it.startTimeOnTrackMs })
@@ -625,7 +674,8 @@ object TimelineEngine {
             startTimeOnTrackMs = max(0L, startMs),
             trimStartMs = 0L,
             trimEndMs = safeDuration,
-            stickerSpec = stickerSpec
+            stickerSpec = stickerSpec,
+            hasAudioTrack = false
         )
         return updateTrack(project, stickerTrack.id) { t ->
             t.copy(clips = (t.clips + clip).sortedBy { it.startTimeOnTrackMs })
@@ -634,6 +684,9 @@ object TimelineEngine {
 
     fun mapTimelineOffsetToSourceMs(clip: TimelineClip, timelineOffsetMs: Long): Long {
         if (clip.isFrozenFrame) return clip.freezeFrameSourceMs
+        if (clip.mediaKind == MediaKind.IMAGE) {
+            return (clip.trimStartMs + timelineOffsetMs).coerceIn(clip.trimStartMs, clip.trimEndMs)
+        }
         val clampedOffset = timelineOffsetMs.coerceIn(0L, clip.timelineDurationMs)
         val activePoints = when {
             clip.speedCurvePoints.size >= 2 -> clip.speedCurvePoints
@@ -719,5 +772,10 @@ data class ImportedMediaSource(
     val durationMs: Long,
     val width: Int = 1080,
     val height: Int = 1920,
-    val waveformPeaks: List<Float> = emptyList()
+    val waveformPeaks: List<Float> = emptyList(),
+    val hasAudioTrack: Boolean = true,
+    val rotationDegreesMeta: Int = 0,
+    val mimeType: String = "",
+    val thumbnailUri: String? = null,
+    val fileSizeBytes: Long = 0L
 )

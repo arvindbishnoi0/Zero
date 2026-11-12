@@ -16,6 +16,8 @@ import com.vibecut.pro.engine.serialization.ProjectJsonCodec
 
 /**
  * WorkManager background worker allowing long 2K/4K renders to continue reliably in the background.
+ * Safely guards `FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING` for Android 15 (API 35+) to avoid
+ * `IllegalArgumentException` / `MissingForegroundServiceTypeException` crashes on Android 10–14.
  */
 class ExportWorker(
     appContext: Context,
@@ -24,7 +26,9 @@ class ExportWorker(
 
     override suspend fun doWork(): Result {
         val projectId = inputData.getString(KEY_PROJECT_ID) ?: return Result.failure()
-        setForeground(createForegroundInfo("Rendering VibeCut Pro Video..."))
+        runCatching {
+            setForeground(createForegroundInfo("Rendering VibeCut Pro Media..."))
+        }
 
         val db = Room.databaseBuilder(
             applicationContext,
@@ -32,8 +36,11 @@ class ExportWorker(
             "vibecut_pro_studio.db"
         ).build()
 
-        val entity = db.vibeCutDao().getProjectById(projectId)
-        db.close()
+        val entity = try {
+            db.vibeCutDao().getProjectById(projectId)
+        } finally {
+            db.close()
+        }
         if (entity == null) return Result.failure()
 
         val project = runCatching { ProjectJsonCodec.decodeProject(entity.projectJson) }.getOrNull()
@@ -66,7 +73,7 @@ class ExportWorker(
             .setOngoing(true)
             .build()
 
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
             ForegroundInfo(
                 1042,
                 notification,

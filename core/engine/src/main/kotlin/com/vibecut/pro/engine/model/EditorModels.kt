@@ -34,6 +34,20 @@ enum class AspectRatioPreset(
         }
     }
 
+    /**
+     * Computes macroblock-aligned dimensions (default 16px) for strict hardware MediaCodec encoders
+     * so non-16:9 aspect ratios (e.g. 4:5, 21:9, 4:3) never fail hardware encoder initialization.
+     */
+    fun computeCodecSafeDimensions(shortSidePx: Int, alignment: Int = 16): Pair<Int, Int> {
+        val (rawW, rawH) = computeDimensions(shortSidePx)
+        val step = max(2, alignment)
+        fun alignNearest(v: Int): Int {
+            val rounded = ((v + step / 2) / step) * step
+            return max(step, rounded)
+        }
+        return alignNearest(rawW) to alignNearest(rawH)
+    }
+
     companion object {
         private fun makeEven(v: Int): Int = if (v % 2 == 0) max(2, v) else max(2, v + 1)
         fun fromId(id: String): AspectRatioPreset =
@@ -49,7 +63,13 @@ enum class TrackType(val label: String, val isVisual: Boolean, val isAudio: Bool
     STICKER("Stickers", isVisual = true, isAudio = false),
     AUDIO_MUSIC("Music", isVisual = false, isAudio = true),
     AUDIO_VOICEOVER("Voiceover", isVisual = false, isAudio = true),
-    AUDIO_SFX("Sound FX", isVisual = false, isAudio = true)
+    AUDIO_SFX("Sound FX", isVisual = false, isAudio = true);
+
+    val isAudioTrack: Boolean
+        get() = this == AUDIO_MUSIC || this == AUDIO_VOICEOVER || this == AUDIO_SFX
+
+    val isVisualTrack: Boolean
+        get() = this == VIDEO_MAIN || this == VIDEO_PIP || this == OVERLAY
 }
 
 enum class MediaKind {
@@ -183,34 +203,372 @@ enum class EffectType(
     val defaultIntensity: Float = 0.65f,
     val secondaryLabel: String = "Detail / Radius",
     val defaultSecondary: Float = 0.5f,
-    val badgeColorHex: Long = 0xFF7C4DFF
+    val badgeColorHex: Long = 0xFF7C4DFF,
+    val primaryLabel: String = "Strength",
+    val tertiaryLabel: String = "Fine Tune",
+    val defaultTertiary: Float = 0.35f
 ) {
-    SHARPEN("Pro Sharpen", EffectCategory.SHARPEN_AND_BLUR, 0.7f, "Radius", 0.5f, 0xFF00E5FF),
-    BLUR("Box Blur", EffectCategory.SHARPEN_AND_BLUR, 0.5f, "Spread", 0.5f, 0xFF448AFF),
-    GAUSSIAN_BLUR("Gaussian Blur", EffectCategory.SHARPEN_AND_BLUR, 0.55f, "Sigma", 0.6f, 0xFF2979FF),
-    MOTION_BLUR("Motion Blur", EffectCategory.SHARPEN_AND_BLUR, 0.6f, "Angle", 0.25f, 0xFF536DFE),
-    BACKGROUND_BLUR("Background Blur", EffectCategory.SHARPEN_AND_BLUR, 0.7f, "Subject Focus", 0.45f, 0xFF00B8D4),
+    // Sharpen, Detail & Blur
+    SHARPEN(
+        label = "Pro Sharpen",
+        category = EffectCategory.SHARPEN_AND_BLUR,
+        defaultIntensity = 0.65f,
+        secondaryLabel = "Radius",
+        defaultSecondary = 0.45f,
+        badgeColorHex = 0xFF00E5FF,
+        primaryLabel = "Sharpness",
+        tertiaryLabel = "Noise Guard",
+        defaultTertiary = 0.25f
+    ),
+    UNSHARP_PRO(
+        label = "HDR Structure",
+        category = EffectCategory.SHARPEN_AND_BLUR,
+        defaultIntensity = 0.60f,
+        secondaryLabel = "Micro Radius",
+        defaultSecondary = 0.50f,
+        badgeColorHex = 0xFF18FFFF,
+        primaryLabel = "Structure",
+        tertiaryLabel = "Halo Clamp",
+        defaultTertiary = 0.40f
+    ),
+    EDGE_SHARPEN(
+        label = "Edge Clarifier",
+        category = EffectCategory.SHARPEN_AND_BLUR,
+        defaultIntensity = 0.70f,
+        secondaryLabel = "Edge Threshold",
+        defaultSecondary = 0.35f,
+        badgeColorHex = 0xFF00B8D4,
+        primaryLabel = "Edge Crisp",
+        tertiaryLabel = "Skin Smooth",
+        defaultTertiary = 0.30f
+    ),
+    BLUR(
+        label = "Box Blur",
+        category = EffectCategory.SHARPEN_AND_BLUR,
+        defaultIntensity = 0.5f,
+        secondaryLabel = "Spread",
+        defaultSecondary = 0.5f,
+        badgeColorHex = 0xFF448AFF,
+        primaryLabel = "Blur Amount",
+        tertiaryLabel = "Soft Mix",
+        defaultTertiary = 1.0f
+    ),
+    GAUSSIAN_BLUR(
+        label = "Gaussian Blur",
+        category = EffectCategory.SHARPEN_AND_BLUR,
+        defaultIntensity = 0.55f,
+        secondaryLabel = "Sigma",
+        defaultSecondary = 0.6f,
+        badgeColorHex = 0xFF2979FF,
+        primaryLabel = "Blur Strength",
+        tertiaryLabel = "Warmth Tint",
+        defaultTertiary = 0.5f
+    ),
+    MOTION_BLUR(
+        label = "Motion Blur",
+        category = EffectCategory.SHARPEN_AND_BLUR,
+        defaultIntensity = 0.6f,
+        secondaryLabel = "Direction Angle",
+        defaultSecondary = 0.25f,
+        badgeColorHex = 0xFF536DFE,
+        primaryLabel = "Streak Length",
+        tertiaryLabel = "Center Keep",
+        defaultTertiary = 0.2f
+    ),
+    BACKGROUND_BLUR(
+        label = "Portrait BG Blur",
+        category = EffectCategory.SHARPEN_AND_BLUR,
+        defaultIntensity = 0.7f,
+        secondaryLabel = "Subject Size",
+        defaultSecondary = 0.45f,
+        badgeColorHex = 0xFF26C6DA,
+        primaryLabel = "Bokeh Blur",
+        tertiaryLabel = "Focus Height",
+        defaultTertiary = 0.54f
+    ),
+    RADIAL_ZOOM_BLUR(
+        label = "Radial Zoom Blur",
+        category = EffectCategory.SHARPEN_AND_BLUR,
+        defaultIntensity = 0.58f,
+        secondaryLabel = "Center Safe Zone",
+        defaultSecondary = 0.35f,
+        badgeColorHex = 0xFF7C4DFF,
+        primaryLabel = "Zoom Streak",
+        tertiaryLabel = "Swirl Twist",
+        defaultTertiary = 0.25f
+    ),
 
-    GLOW("Soft Glow", EffectCategory.GLOW_AND_LIGHT, 0.55f, "Threshold", 0.6f, 0xFFFFD740),
-    NEON_GLOW("Neon Edge Glow", EffectCategory.GLOW_AND_LIGHT, 0.75f, "Hue Shift", 0.4f, 0xFFE040FB),
-    FLASH("Strobe Flash", EffectCategory.GLOW_AND_LIGHT, 0.6f, "Frequency", 0.5f, 0xFFFFFFFF),
-    LIGHT_LEAKS("Light Leaks", EffectCategory.GLOW_AND_LIGHT, 0.65f, "Warmth", 0.7f, 0xFFFF6E40),
+    // Glow & Light
+    GLOW(
+        label = "Soft Bloom Glow",
+        category = EffectCategory.GLOW_AND_LIGHT,
+        defaultIntensity = 0.55f,
+        secondaryLabel = "Highlight Cutoff",
+        defaultSecondary = 0.55f,
+        badgeColorHex = 0xFFFFD740,
+        primaryLabel = "Glow Strength",
+        tertiaryLabel = "Spread Radius",
+        defaultTertiary = 0.5f
+    ),
+    NEON_GLOW(
+        label = "Neon Edge Glow",
+        category = EffectCategory.GLOW_AND_LIGHT,
+        defaultIntensity = 0.75f,
+        secondaryLabel = "Color Hue",
+        defaultSecondary = 0.4f,
+        badgeColorHex = 0xFFE040FB,
+        primaryLabel = "Neon Intensity",
+        tertiaryLabel = "Pulse Speed",
+        defaultTertiary = 0.45f
+    ),
+    HALATION(
+        label = "Film Halation",
+        category = EffectCategory.GLOW_AND_LIGHT,
+        defaultIntensity = 0.60f,
+        secondaryLabel = "Bloom Spread",
+        defaultSecondary = 0.55f,
+        badgeColorHex = 0xFFFF5252,
+        primaryLabel = "Red Halation",
+        tertiaryLabel = "Threshold",
+        defaultTertiary = 0.60f
+    ),
+    DREAMY_BOKEH(
+        label = "Pro-Mist Dream",
+        category = EffectCategory.GLOW_AND_LIGHT,
+        defaultIntensity = 0.52f,
+        secondaryLabel = "Mist Diffusion",
+        defaultSecondary = 0.55f,
+        badgeColorHex = 0xFFF48FB1,
+        primaryLabel = "Dream Softness",
+        tertiaryLabel = "Warm Halo",
+        defaultTertiary = 0.45f
+    ),
+    FLASH(
+        label = "Strobe Flash",
+        category = EffectCategory.GLOW_AND_LIGHT,
+        defaultIntensity = 0.6f,
+        secondaryLabel = "Flash Rate",
+        defaultSecondary = 0.5f,
+        badgeColorHex = 0xFFFFFFFF,
+        primaryLabel = "Flash Power",
+        tertiaryLabel = "Warm/Cool Tint",
+        defaultTertiary = 0.5f
+    ),
+    LIGHT_LEAKS(
+        label = "Cinema Light Leak",
+        category = EffectCategory.GLOW_AND_LIGHT,
+        defaultIntensity = 0.65f,
+        secondaryLabel = "Amber / Rose",
+        defaultSecondary = 0.7f,
+        badgeColorHex = 0xFFFF6E40,
+        primaryLabel = "Leak Brightness",
+        tertiaryLabel = "Drift Speed",
+        defaultTertiary = 0.5f
+    ),
 
-    GLITCH("Digital Glitch", EffectCategory.GLITCH_AND_RETRO, 0.65f, "Slice Rate", 0.55f, 0xFFFF1744),
-    RGB_SPLIT("RGB Split", EffectCategory.GLITCH_AND_RETRO, 0.6f, "Angle", 0.15f, 0xFFFF4081),
-    VHS("VHS Tape", EffectCategory.GLITCH_AND_RETRO, 0.7f, "Tracking Jitter", 0.5f, 0xFF7C4DFF),
-    FILM_GRAIN("Film Grain", EffectCategory.GLITCH_AND_RETRO, 0.45f, "Grain Size", 0.5f, 0xFFA1887F),
-    OLD_FILM("Old Film 16mm", EffectCategory.GLITCH_AND_RETRO, 0.7f, "Scratches", 0.6f, 0xFFD7CCC8),
+    // Glitch & Retro
+    GLITCH(
+        label = "Digital Glitch",
+        category = EffectCategory.GLITCH_AND_RETRO,
+        defaultIntensity = 0.65f,
+        secondaryLabel = "Slice Speed",
+        defaultSecondary = 0.55f,
+        badgeColorHex = 0xFFFF1744,
+        primaryLabel = "Glitch Tear",
+        tertiaryLabel = "RGB Offset",
+        defaultTertiary = 0.55f
+    ),
+    RGB_SPLIT(
+        label = "RGB Split",
+        category = EffectCategory.GLITCH_AND_RETRO,
+        defaultIntensity = 0.6f,
+        secondaryLabel = "Split Angle",
+        defaultSecondary = 0.15f,
+        badgeColorHex = 0xFFFF4081,
+        primaryLabel = "Separation",
+        tertiaryLabel = "Edge Only",
+        defaultTertiary = 0.25f
+    ),
+    VHS(
+        label = "VHS 1998 Tape",
+        category = EffectCategory.GLITCH_AND_RETRO,
+        defaultIntensity = 0.7f,
+        secondaryLabel = "Tracking Jitter",
+        defaultSecondary = 0.5f,
+        badgeColorHex = 0xFF7C4DFF,
+        primaryLabel = "Tape Wear",
+        tertiaryLabel = "Color Bleed",
+        defaultTertiary = 0.55f
+    ),
+    SCANLINES_CRT(
+        label = "CRT Monitor",
+        category = EffectCategory.GLITCH_AND_RETRO,
+        defaultIntensity = 0.60f,
+        secondaryLabel = "Scan Density",
+        defaultSecondary = 0.55f,
+        badgeColorHex = 0xFF00E676,
+        primaryLabel = "CRT Mask",
+        tertiaryLabel = "Screen Curve",
+        defaultTertiary = 0.35f
+    ),
+    PIXELATE(
+        label = "Pixel Mosaic",
+        category = EffectCategory.GLITCH_AND_RETRO,
+        defaultIntensity = 0.55f,
+        secondaryLabel = "Color Crunch",
+        defaultSecondary = 0.30f,
+        badgeColorHex = 0xFFFFAB00,
+        primaryLabel = "Pixel Size",
+        tertiaryLabel = "Grid Border",
+        defaultTertiary = 0.15f
+    ),
+    FILM_GRAIN(
+        label = "35mm Film Grain",
+        category = EffectCategory.GLITCH_AND_RETRO,
+        defaultIntensity = 0.45f,
+        secondaryLabel = "Grain Size",
+        defaultSecondary = 0.5f,
+        badgeColorHex = 0xFFA1887F,
+        primaryLabel = "Grain Amount",
+        tertiaryLabel = "Shadow Weight",
+        defaultTertiary = 0.6f
+    ),
+    OLD_FILM(
+        label = "Old Film 16mm",
+        category = EffectCategory.GLITCH_AND_RETRO,
+        defaultIntensity = 0.7f,
+        secondaryLabel = "Scratches",
+        defaultSecondary = 0.6f,
+        badgeColorHex = 0xFFD7CCC8,
+        primaryLabel = "Vintage Look",
+        tertiaryLabel = "Flicker",
+        defaultTertiary = 0.5f
+    ),
 
-    CINEMATIC("Cinematic Scope", EffectCategory.CAMERA_AND_MOTION, 0.75f, "Letterbox", 0.5f, 0xFFFFAB00),
-    SHAKE("Camera Shake", EffectCategory.CAMERA_AND_MOTION, 0.55f, "Speed", 0.65f, 0xFFFF5252),
-    ZOOM("Dynamic Zoom", EffectCategory.CAMERA_AND_MOTION, 0.6f, "Pulse Rate", 0.5f, 0xFF69F0AE),
+    // Motion & Camera
+    CINEMATIC(
+        label = "Cinematic Scope",
+        category = EffectCategory.CAMERA_AND_MOTION,
+        defaultIntensity = 0.75f,
+        secondaryLabel = "Letterbox Bar",
+        defaultSecondary = 0.5f,
+        badgeColorHex = 0xFFFFAB00,
+        primaryLabel = "Anamorphic Tone",
+        tertiaryLabel = "Teal Contrast",
+        defaultTertiary = 0.5f
+    ),
+    SHAKE(
+        label = "Camera Shake",
+        category = EffectCategory.CAMERA_AND_MOTION,
+        defaultIntensity = 0.55f,
+        secondaryLabel = "Shake Frequency",
+        defaultSecondary = 0.65f,
+        badgeColorHex = 0xFFFF5252,
+        primaryLabel = "Impact Power",
+        tertiaryLabel = "Rotation Roll",
+        defaultTertiary = 0.35f
+    ),
+    ZOOM(
+        label = "Beat Pulse Zoom",
+        category = EffectCategory.CAMERA_AND_MOTION,
+        defaultIntensity = 0.6f,
+        secondaryLabel = "Pulse Speed",
+        defaultSecondary = 0.5f,
+        badgeColorHex = 0xFF69F0AE,
+        primaryLabel = "Zoom Depth",
+        tertiaryLabel = "Center Smooth",
+        defaultTertiary = 0.5f
+    ),
+    MIRROR_KALEIDOSCOPE(
+        label = "Mirror / Kaleido",
+        category = EffectCategory.CAMERA_AND_MOTION,
+        defaultIntensity = 0.85f,
+        secondaryLabel = "Symmetry Mode",
+        defaultSecondary = 0.35f,
+        badgeColorHex = 0xFF00E5FF,
+        primaryLabel = "Mirror Mix",
+        tertiaryLabel = "Center Offset",
+        defaultTertiary = 0.5f
+    ),
 
-    CHROMATIC_ABERRATION("Chromatic Aberration", EffectCategory.STYLIZE_AND_LENS, 0.6f, "Edge Falloff", 0.5f, 0xFF18FFFF),
-    VIGNETTE("Optical Vignette", EffectCategory.STYLIZE_AND_LENS, 0.55f, "Roundness", 0.6f, 0xFF90A4AE),
-    LENS_DISTORTION("Lens Distortion", EffectCategory.STYLIZE_AND_LENS, 0.5f, "Barrel / Pincushion", 0.7f, 0xFF40C4FF),
-    CARTOON("Cartoon Cel", EffectCategory.STYLIZE_AND_LENS, 0.75f, "Ink Levels", 0.55f, 0xFFFF9100),
-    COLOR_DISTORTION("Color Distortion", EffectCategory.STYLIZE_AND_LENS, 0.65f, "Phase", 0.5f, 0xFFEA80FC)
+    // Stylize & Lens
+    CHROMATIC_ABERRATION(
+        label = "Lens Fringe",
+        category = EffectCategory.STYLIZE_AND_LENS,
+        defaultIntensity = 0.6f,
+        secondaryLabel = "Edge Falloff",
+        defaultSecondary = 0.5f,
+        badgeColorHex = 0xFF18FFFF,
+        primaryLabel = "Prism Shift",
+        tertiaryLabel = "Radial Zoom",
+        defaultTertiary = 0.35f
+    ),
+    VIGNETTE(
+        label = "Optical Vignette",
+        category = EffectCategory.STYLIZE_AND_LENS,
+        defaultIntensity = 0.55f,
+        secondaryLabel = "Roundness",
+        defaultSecondary = 0.6f,
+        badgeColorHex = 0xFF90A4AE,
+        primaryLabel = "Darkness",
+        tertiaryLabel = "Feather Size",
+        defaultTertiary = 0.55f
+    ),
+    LENS_DISTORTION(
+        label = "Fisheye / Lens",
+        category = EffectCategory.STYLIZE_AND_LENS,
+        defaultIntensity = 0.5f,
+        secondaryLabel = "Barrel <-> Pinch",
+        defaultSecondary = 0.75f,
+        badgeColorHex = 0xFF40C4FF,
+        primaryLabel = "Warp Power",
+        tertiaryLabel = "Edge Fill",
+        defaultTertiary = 0.5f
+    ),
+    CARTOON(
+        label = "Cartoon Cel",
+        category = EffectCategory.STYLIZE_AND_LENS,
+        defaultIntensity = 0.75f,
+        secondaryLabel = "Color Levels",
+        defaultSecondary = 0.55f,
+        badgeColorHex = 0xFFFF9100,
+        primaryLabel = "Cel Effect",
+        tertiaryLabel = "Ink Thickness",
+        defaultTertiary = 0.5f
+    ),
+    COLOR_DISTORTION(
+        label = "Psychedelic Wave",
+        category = EffectCategory.STYLIZE_AND_LENS,
+        defaultIntensity = 0.65f,
+        secondaryLabel = "Color Phase",
+        defaultSecondary = 0.5f,
+        badgeColorHex = 0xFFEA80FC,
+        primaryLabel = "Prism Mix",
+        tertiaryLabel = "Cycle Speed",
+        defaultTertiary = 0.45f
+    ),
+    DUOTONE(
+        label = "Cyber Duotone",
+        category = EffectCategory.STYLIZE_AND_LENS,
+        defaultIntensity = 0.80f,
+        secondaryLabel = "Palette Theme",
+        defaultSecondary = 0.25f,
+        badgeColorHex = 0xFFE040FB,
+        primaryLabel = "Duotone Mix",
+        tertiaryLabel = "Contrast Split",
+        defaultTertiary = 0.5f
+    ),
+    POSTERIZE_POP(
+        label = "Pop Art Poster",
+        category = EffectCategory.STYLIZE_AND_LENS,
+        defaultIntensity = 0.70f,
+        secondaryLabel = "Tone Steps",
+        defaultSecondary = 0.40f,
+        badgeColorHex = 0xFFFFEA00,
+        primaryLabel = "Poster Mix",
+        tertiaryLabel = "Saturation Boost",
+        defaultTertiary = 0.55f
+    )
 }
 
 data class AppliedEffect(
@@ -218,6 +576,7 @@ data class AppliedEffect(
     val type: EffectType,
     val intensity: Float = type.defaultIntensity,     // [0f, 1f]
     val secondaryParam: Float = type.defaultSecondary,// [0f, 1f]
+    val tertiaryParam: Float = type.defaultTertiary,  // [0f, 1f]
     val enabled: Boolean = true
 )
 
@@ -265,6 +624,43 @@ data class RgbCurvesConfig(
             CurvePoint(1f, 1f)
         )
 
+        fun sContrastCurve(): List<CurvePoint> = listOf(
+            CurvePoint(0f, 0f),
+            CurvePoint(0.25f, 0.18f),
+            CurvePoint(0.5f, 0.5f),
+            CurvePoint(0.75f, 0.82f),
+            CurvePoint(1f, 1f)
+        )
+
+        fun matteFadeCurve(): List<CurvePoint> = listOf(
+            CurvePoint(0f, 0.09f),
+            CurvePoint(0.25f, 0.24f),
+            CurvePoint(0.5f, 0.50f),
+            CurvePoint(0.75f, 0.77f),
+            CurvePoint(1f, 0.96f)
+        )
+
+        fun brightLiftCurve(): List<CurvePoint> = listOf(
+            CurvePoint(0f, 0.02f),
+            CurvePoint(0.25f, 0.32f),
+            CurvePoint(0.5f, 0.58f),
+            CurvePoint(0.75f, 0.82f),
+            CurvePoint(1f, 1f)
+        )
+
+        val linearPoints: List<CurvePoint> get() = defaultCurve()
+        val sCurvePoints: List<CurvePoint> get() = sContrastCurve()
+        val matteLiftPoints: List<CurvePoint> get() = matteFadeCurve()
+        val highContrastPoints: List<CurvePoint>
+            get() = listOf(
+                CurvePoint(0f, 0f),
+                CurvePoint(0.25f, 0.14f),
+                CurvePoint(0.5f, 0.5f),
+                CurvePoint(0.75f, 0.86f),
+                CurvePoint(1f, 1f)
+            )
+        val softHighlightRollPoints: List<CurvePoint> get() = brightLiftCurve()
+
         private fun isDefault(pts: List<CurvePoint>): Boolean =
             pts.all { abs(it.x - it.y) < 0.002f }
     }
@@ -286,42 +682,192 @@ data class ColorWheelsConfig(
 ) {
     val isNeutral: Boolean
         get() = shadows.isNeutral && midtones.isNeutral && highlights.isNeutral
+
+    val isIdentity: Boolean
+        get() = isNeutral
 }
 
 data class ColorGradeConfig(
-    val brightness: Float = 0f,   // [-1f, 1f]
-    val contrast: Float = 0f,     // [-1f, 1f]
-    val saturation: Float = 0f,   // [-1f, 1f]
-    val exposure: Float = 0f,     // [-2f, 2f] EV stops
-    val temperature: Float = 0f,  // [-1f, 1f] cool <-> warm
-    val tint: Float = 0f,         // [-1f, 1f] green <-> magenta
-    val highlights: Float = 0f,   // [-1f, 1f]
-    val shadows: Float = 0f,      // [-1f, 1f]
-    val sharpness: Float = 0f,    // [0f, 1f] dedicated grading sharpness
-    val fade: Float = 0f,         // [0f, 1f] matte film fade
+    // Light & Tone
+    val brightness: Float = 0f,        // [-1f, 1f]
+    val contrast: Float = 0f,          // [-1f, 1f]
+    val saturation: Float = 0f,        // [-1f, 1f]
+    val vibrance: Float = 0f,          // [-1f, 1f] skin-safe saturation boost
+    val exposure: Float = 0f,          // [-2f, 2f] EV stops
+    val temperature: Float = 0f,       // [-1f, 1f] cool <-> warm
+    val tint: Float = 0f,              // [-1f, 1f] green <-> magenta
+    val hueShift: Float = 0f,          // [-1f, 1f] global hue shift
+    val highlights: Float = 0f,        // [-1f, 1f]
+    val shadows: Float = 0f,           // [-1f, 1f]
+    val whites: Float = 0f,            // [-1f, 1f] white point
+    val blacks: Float = 0f,            // [-1f, 1f] black point
+    val gamma: Float = 0f,             // [-1f, 1f] midtone gamma
+    // Detail, Sharpen, Clarity & Denoise
+    val sharpness: Float = 0f,         // [0f, 1f] dedicated grading sharpness
+    val sharpenRadius: Float = 0.35f,  // [0f, 1f] -> 0.6..3.8px radius
+    val sharpenThreshold: Float = 0.12f,// [0f, 1f] -> noise/skin protection threshold
+    val clarity: Float = 0f,           // [-1f, 1f] local midtone contrast / soft glow
+    val structure: Float = 0f,         // [0f, 1f] micro-texture crispness
+    val dehaze: Float = 0f,            // [-1f, 1f] atmospheric haze removal
+    val denoise: Float = 0f,           // [0f, 1f] edge-preserving luma/skin smooth
+    // Optical & Film Finishing
+    val vignette: Float = 0f,          // [-1f, 1f] >0 dark cinema, <0 white vignette
+    val vignetteFeather: Float = 0.5f, // [0f, 1f] vignette softness
+    val grain: Float = 0f,             // [0f, 1f] organic film grain
+    val fade: Float = 0f,              // [0f, 1f] matte film black lift
+    // Pro Grading & Independent Filter/LUT
     val hslBands: List<HslBandAdjustment> = HslBand.entries.map { HslBandAdjustment(it) },
     val curves: RgbCurvesConfig = RgbCurvesConfig(),
     val colorWheels: ColorWheelsConfig = ColorWheelsConfig(),
     val lutPresetId: String? = null,
     val customCubeLutUri: String? = null,
-    val lutIntensity: Float = 1.0f // [0f, 1f]
+    val lutIntensity: Float = 1.0f     // [0f, 1f] controls ONLY Filter/LUT strength
 ) {
+    val hasColorLutChanges: Boolean
+        get() = abs(brightness) >= 0.001f ||
+            abs(contrast) >= 0.001f ||
+            abs(saturation) >= 0.001f ||
+            abs(vibrance) >= 0.001f ||
+            abs(exposure) >= 0.001f ||
+            abs(temperature) >= 0.001f ||
+            abs(tint) >= 0.001f ||
+            abs(hueShift) >= 0.001f ||
+            abs(highlights) >= 0.001f ||
+            abs(shadows) >= 0.001f ||
+            abs(whites) >= 0.001f ||
+            abs(blacks) >= 0.001f ||
+            abs(gamma) >= 0.001f ||
+            abs(dehaze) >= 0.001f ||
+            abs(fade) >= 0.001f ||
+            hslBands.any { !it.isNeutral } ||
+            !curves.isIdentity ||
+            !colorWheels.isNeutral ||
+            (lutPresetId != null && lutIntensity > 0.001f) ||
+            (!customCubeLutUri.isNullOrBlank() && lutIntensity > 0.001f)
+
+    val hasSpatialDetailChanges: Boolean
+        get() = sharpness > 0.003f ||
+            abs(clarity) >= 0.003f ||
+            structure > 0.003f ||
+            denoise > 0.003f ||
+            abs(vignette) >= 0.003f ||
+            grain > 0.003f
+
     val isNeutral: Boolean
-        get() = abs(brightness) < 0.001f &&
-            abs(contrast) < 0.001f &&
-            abs(saturation) < 0.001f &&
-            abs(exposure) < 0.001f &&
-            abs(temperature) < 0.001f &&
-            abs(tint) < 0.001f &&
-            abs(highlights) < 0.001f &&
-            abs(shadows) < 0.001f &&
-            abs(sharpness) < 0.001f &&
-            abs(fade) < 0.001f &&
-            hslBands.all { it.isNeutral } &&
-            curves.isIdentity &&
-            colorWheels.isNeutral &&
-            lutPresetId == null &&
-            customCubeLutUri == null
+        get() = !hasColorLutChanges && !hasSpatialDetailChanges &&
+            lutPresetId == null && customCubeLutUri.isNullOrBlank()
+
+    val isIdentity: Boolean
+        get() = isNeutral
+
+    val hasActiveFilter: Boolean
+        get() = (lutPresetId != null || !customCubeLutUri.isNullOrBlank()) && lutIntensity > 0.005f
+
+    val activeDetailCount: Int
+        get() = listOf(
+            sharpness > 0.005f,
+            abs(clarity) > 0.005f,
+            structure > 0.005f,
+            abs(dehaze) > 0.005f,
+            denoise > 0.005f
+        ).count { it }
+
+    val activeAdjustCount: Int
+        get() = listOf(
+            abs(exposure) > 0.005f,
+            abs(brightness) > 0.005f,
+            abs(contrast) > 0.005f,
+            abs(highlights) > 0.005f,
+            abs(shadows) > 0.005f,
+            abs(whites) > 0.005f,
+            abs(blacks) > 0.005f,
+            abs(gamma) > 0.005f,
+            abs(saturation) > 0.005f,
+            abs(vibrance) > 0.005f,
+            abs(temperature) > 0.005f,
+            abs(tint) > 0.005f,
+            abs(hueShift) > 0.005f,
+            abs(vignette) > 0.005f,
+            grain > 0.005f,
+            fade > 0.005f,
+            hslBands.any { !it.isNeutral },
+            !curves.isIdentity,
+            !colorWheels.isNeutral
+        ).count { it }
+
+    val activeManualAdjustmentCount: Int
+        get() = activeDetailCount + activeAdjustCount
+
+    fun resetDetailOnly(): ColorGradeConfig = copy(
+        sharpness = 0f,
+        sharpenRadius = 0.35f,
+        sharpenThreshold = 0.12f,
+        clarity = 0f,
+        structure = 0f,
+        dehaze = 0f,
+        denoise = 0f
+    )
+
+    fun resetDetailAndOptics(): ColorGradeConfig = resetDetailOnly().copy(
+        vignette = 0f,
+        vignetteFeather = 0.5f,
+        grain = 0f
+    )
+
+    fun resetLight(): ColorGradeConfig = copy(
+        brightness = 0f,
+        contrast = 0f,
+        exposure = 0f,
+        highlights = 0f,
+        shadows = 0f,
+        whites = 0f,
+        blacks = 0f,
+        gamma = 0f,
+        fade = 0f
+    )
+
+    fun resetColor(): ColorGradeConfig = copy(
+        saturation = 0f,
+        vibrance = 0f,
+        temperature = 0f,
+        tint = 0f,
+        hueShift = 0f
+    )
+
+    fun resetAdjustOnly(): ColorGradeConfig = copy(
+        brightness = 0f,
+        contrast = 0f,
+        saturation = 0f,
+        vibrance = 0f,
+        exposure = 0f,
+        temperature = 0f,
+        tint = 0f,
+        hueShift = 0f,
+        highlights = 0f,
+        shadows = 0f,
+        whites = 0f,
+        blacks = 0f,
+        gamma = 0f,
+        vignette = 0f,
+        vignetteFeather = 0.5f,
+        grain = 0f,
+        fade = 0f,
+        hslBands = defaultHslBands(),
+        curves = RgbCurvesConfig(),
+        colorWheels = ColorWheelsConfig()
+    )
+
+    fun resetFilterOnly(): ColorGradeConfig = copy(
+        lutPresetId = null,
+        customCubeLutUri = null,
+        lutIntensity = 1.0f
+    )
+
+    fun resetFilter(): ColorGradeConfig = resetFilterOnly()
+
+    companion object {
+        fun defaultHslBands(): List<HslBandAdjustment> = HslBand.entries.map { HslBandAdjustment(it) }
+    }
 }
 
 data class ColorGradePreset(
@@ -329,6 +875,7 @@ data class ColorGradePreset(
     val name: String,
     val category: String = "Cinematic",
     val accentHex: Long = 0xFFFF9800,
+    val secondaryHex: Long = 0xFF1E293B,
     val config: ColorGradeConfig,
     val isUserCustom: Boolean = false
 )
@@ -486,11 +1033,21 @@ data class TimelineClip(
     val stickerSpec: StickerSpec? = null,
     val waveformPeaks: List<Float> = emptyList(),
     val beatMarkersMs: List<Long> = emptyList(),
-    val upscaleTargetHeight: Int? = null
+    val upscaleTargetHeight: Int? = null,
+    val hasAudioTrack: Boolean = true,
+    val sourceWidth: Int = 1080,
+    val sourceHeight: Int = 1920,
+    val rotationDegreesMeta: Int = 0,
+    val mimeType: String = "",
+    val thumbnailUri: String? = null
 ) {
+    /** Effective end trim position in source ms, safely handling -1L / uninitialized trimEndMs. */
+    val effectiveTrimEndMs: Long
+        get() = if (trimEndMs > trimStartMs) trimEndMs else max(trimStartMs + 50L, sourceDurationMs)
+
     /** Raw trimmed span in source media milliseconds before speed scaling. */
     val trimmedSourceDurationMs: Long
-        get() = max(50L, trimEndMs - trimStartMs)
+        get() = max(50L, effectiveTrimEndMs - trimStartMs)
 
     /** Effective timeline duration accounting for constant speed or integrated speed curve. */
     val timelineDurationMs: Long
@@ -524,6 +1081,33 @@ data class TimelineClip(
     val endTimeOnTrackMs: Long
         get() = startTimeOnTrackMs + timelineDurationMs
 
+    fun instantaneousSpeedAt(normalizedOffset: Float): Float {
+        if (isFrozenFrame || mediaKind == MediaKind.IMAGE) return 1.0f
+        val activePoints = when {
+            speedCurvePoints.size >= 2 -> speedCurvePoints
+            speedCurvePreset != SpeedCurvePreset.NONE -> speedCurvePreset.defaultPoints
+            else -> emptyList()
+        }
+        return if (activePoints.size >= 2) {
+            sampleSpeedCurve(activePoints.sortedBy { it.normalizedPosition }, normalizedOffset).coerceIn(0.1f, 10f)
+        } else {
+            speed.coerceIn(0.1f, 10f)
+        }
+    }
+
+    fun mapTimelineOffsetToSourceMs(localTimelineOffsetMs: Long): Long {
+        if (isFrozenFrame) return freezeFrameSourceMs.coerceIn(0L, sourceDurationMs)
+        if (mediaKind == MediaKind.IMAGE) return localTimelineOffsetMs.coerceIn(0L, trimmedSourceDurationMs)
+        val dur = timelineDurationMs.coerceAtLeast(1L)
+        val norm = (localTimelineOffsetMs.toDouble() / dur.toDouble()).coerceIn(0.0, 1.0)
+        val rawOffsetMs = (norm * trimmedSourceDurationMs.toDouble()).roundToLong()
+        return if (isReversed) {
+            (effectiveTrimEndMs - rawOffsetMs).coerceIn(trimStartMs, effectiveTrimEndMs)
+        } else {
+            (trimStartMs + rawOffsetMs).coerceIn(trimStartMs, effectiveTrimEndMs)
+        }
+    }
+
     companion object {
         fun sampleSpeedCurve(sortedPoints: List<SpeedPoint>, u: Float): Float {
             if (sortedPoints.isEmpty()) return 1.0f
@@ -540,7 +1124,6 @@ data class TimelineClip(
                 if (clamped in a.normalizedPosition..b.normalizedPosition) {
                     val span = (b.normalizedPosition - a.normalizedPosition).coerceAtLeast(0.0001f)
                     val t = (clamped - a.normalizedPosition) / span
-                    // Smooth cosine/hermite blend for natural VN-style speed ramp
                     val smoothT = t * t * (3f - 2f * t)
                     return a.speedMultiplier + (b.speedMultiplier - a.speedMultiplier) * smoothT
                 }
@@ -599,6 +1182,7 @@ data class ExportConfig(
     val customBitrateMbps: Float = 16.0f,
     val codec: VideoCodecOption = VideoCodecOption.H264,
     val audioOnly: Boolean = false,
+    val exportAsPhotoFrame: Boolean = false,
     val audioBitrateKbps: Int = 192,
     val saveToGallery: Boolean = true,
     val runInBackground: Boolean = false
@@ -615,6 +1199,10 @@ data class ExportConfig(
     }
 
     fun estimatedFileSizeMb(durationMs: Long, aspectRatio: AspectRatioPreset): Float {
+        if (exportAsPhotoFrame) {
+            val (w, h) = aspectRatio.computeDimensions(resolution.shortSidePx)
+            return ((w.toLong() * h.toLong() * 0.45f) / (1024f * 1024f)).coerceIn(0.4f, 12f)
+        }
         val seconds = (durationMs / 1000f).coerceAtLeast(1f)
         val audioBps = audioBitrateKbps * 1000L
         val videoBps = if (audioOnly) 0L else targetVideoBitrateBps(aspectRatio).toLong()
@@ -643,11 +1231,25 @@ data class Project(
     val totalDurationMs: Long
         get() = tracks.filter { !it.isHidden }.maxOfOrNull { it.durationMs } ?: 0L
 
+    val mainVideoClips: List<TimelineClip>
+        get() = tracks.firstOrNull { it.type == TrackType.VIDEO_MAIN && !it.isHidden }?.clips.orEmpty()
+
+    fun trackByType(type: TrackType): Track? =
+        tracks.firstOrNull { it.type == type }
+
     fun findClip(clipId: String): TimelineClip? =
         tracks.asSequence().flatMap { it.clips.asSequence() }.firstOrNull { it.id == clipId }
 
     fun findTrackForClip(clipId: String): Track? =
         tracks.firstOrNull { track -> track.clips.any { it.id == clipId } }
+
+    fun findMainClipAt(timelineMs: Long): TimelineClip? {
+        val mainClips = tracks.firstOrNull { it.type == TrackType.VIDEO_MAIN && !it.isHidden }?.clips.orEmpty()
+        if (mainClips.isEmpty()) return null
+        return mainClips.firstOrNull { timelineMs in it.startTimeOnTrackMs until it.endTimeOnTrackMs }
+            ?: mainClips.lastOrNull { timelineMs >= it.startTimeOnTrackMs }
+            ?: mainClips.first()
+    }
 
     companion object {
         fun defaultTracks(): List<Track> = listOf(

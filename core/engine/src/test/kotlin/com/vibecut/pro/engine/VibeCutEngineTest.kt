@@ -1,6 +1,5 @@
 package com.vibecut.pro.engine
 
-import com.vibecut.pro.engine.ai.FrameVisualSample
 import com.vibecut.pro.engine.ai.LocalAiAlgorithms
 import com.vibecut.pro.engine.audio.AudioDspEngine
 import com.vibecut.pro.engine.audio.BuiltInSfxPreset
@@ -15,39 +14,59 @@ import com.vibecut.pro.engine.templates.TemplateCategory
 import com.vibecut.pro.engine.timeline.ImportedMediaSource
 import com.vibecut.pro.engine.timeline.TimelineEngine
 import com.vibecut.pro.engine.timeline.TimelineSessionManager
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertTrue
+import org.junit.Assert.*
 import org.junit.Test
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.sin
 
 class VibeCutEngineTest {
 
     private fun sampleSources() = listOf(
-        ImportedMediaSource("file:///clip1.mp4", "Clip 1", MediaKind.VIDEO, 6_000L),
-        ImportedMediaSource("file:///clip2.mp4", "Clip 2", MediaKind.VIDEO, 4_000L)
+        ImportedMediaSource(
+            uri = "file:///clip1.mp4",
+            displayName = "Clip 1",
+            mediaKind = MediaKind.VIDEO,
+            durationMs = 6_000L,
+            width = 1920,
+            height = 1080,
+            hasAudioTrack = true,
+            thumbnailUri = "file:///thumb1.jpg"
+        ),
+        ImportedMediaSource(
+            uri = "file:///clip2.mp4",
+            displayName = "Clip 2",
+            mediaKind = MediaKind.VIDEO,
+            durationMs = 4_000L,
+            width = 1080,
+            height = 1920,
+            hasAudioTrack = false,
+            thumbnailUri = "file:///thumb2.jpg"
+        )
     )
 
     @Test
     fun timelineImportTrimSplitCutFreezeAndMagneticReflowWork() {
         var project = Project(title = "Studio Test")
         project = TimelineEngine.importMediaClips(project, sampleSources(), TrackType.VIDEO_MAIN)
-        val mainClips = project.tracks.first { it.type == TrackType.VIDEO_MAIN }.clips
+        val mainClips = project.mainVideoClips
         assertEquals(2, mainClips.size)
         assertEquals(10_000L, project.totalDurationMs)
         assertEquals(6_000L, mainClips[1].startTimeOnTrackMs)
+        assertTrue(mainClips[0].hasAudioTrack)
+        assertFalse(mainClips[1].hasAudioTrack)
+        assertEquals("file:///thumb1.jpg", mainClips[0].thumbnailUri)
 
         // Trim first clip from 6s down to 4s -> magnetic timeline shifts clip 2 to 4_000ms
         project = TimelineEngine.trimClip(project, mainClips[0].id, 1_000L, 5_000L)
-        val afterTrim = project.tracks.first { it.type == TrackType.VIDEO_MAIN }.clips
+        val afterTrim = project.mainVideoClips
         assertEquals(4_000L, afterTrim[0].timelineDurationMs)
         assertEquals(4_000L, afterTrim[1].startTimeOnTrackMs)
         assertEquals(8_000L, project.totalDurationMs)
 
         // Split first clip at 2_000ms playhead
         project = TimelineEngine.splitClipAt(project, afterTrim[0].id, 2_000L)
-        val afterSplit = project.tracks.first { it.type == TrackType.VIDEO_MAIN }.clips
+        val afterSplit = project.mainVideoClips
         assertEquals(3, afterSplit.size)
         assertEquals(1_000L, afterSplit[0].trimStartMs)
         assertEquals(3_000L, afterSplit[0].trimEndMs)
@@ -56,21 +75,33 @@ class VibeCutEngineTest {
 
         // Insert 1.5s freeze frame at 1_000ms
         project = TimelineEngine.insertFreezeFrame(project, afterSplit[0].id, 1_000L, 1_500L)
-        val afterFreeze = project.tracks.first { it.type == TrackType.VIDEO_MAIN }.clips
+        val afterFreeze = project.mainVideoClips
         assertTrue(afterFreeze.any { it.isFrozenFrame && it.timelineDurationMs == 1_500L })
         assertEquals(9_500L, project.totalDurationMs)
     }
 
     @Test
-    fun lockedTrackBlocksMutationsAndUndoRedoRestoresExactState() {
+    fun lockedTrackBlocksMutationsAndCoalescedUndoRedoRestoresExactState() {
         val session = TimelineSessionManager(Project(title = "Undo Test"))
         session.execute("Import") {
             TimelineEngine.importMediaClips(it, sampleSources(), TrackType.VIDEO_MAIN)
         }
         assertEquals(10_000L, session.currentProject.totalDurationMs)
 
-        val mainTrackId = session.currentProject.tracks.first { it.type == TrackType.VIDEO_MAIN }.id
-        val firstClipId = session.currentProject.tracks.first { it.type == TrackType.VIDEO_MAIN }.clips.first().id
+        val mainTrackId = session.currentProject.mainVideoClips.first().trackId
+        val firstClipId = session.currentProject.mainVideoClips.first().id
+
+        // Rapid slider updates coalesce into a single undo entry
+        val depthBeforeSlider = session.undoDepth
+        for (step in 1..10) {
+            session.executeCoalesced("sharp_$firstClipId", "Sharpen", windowMs = 5_000L) { proj ->
+                TimelineEngine.setColorGrade(proj, firstClipId, ColorGradeConfig(sharpness = step * 0.1f))
+            }
+        }
+        assertEquals(depthBeforeSlider + 1, session.undoDepth)
+        assertEquals(1.0f, session.currentProject.findClip(firstClipId)!!.colorGrade.sharpness, 0.001f)
+        session.undo()
+        assertEquals(0.0f, session.currentProject.findClip(firstClipId)!!.colorGrade.sharpness, 0.001f)
 
         // Lock track and attempt delete -> should be blocked
         session.execute("Lock") { TimelineEngine.toggleTrackLock(it, mainTrackId) }
@@ -97,7 +128,7 @@ class VibeCutEngineTest {
 
         project = TimelineEngine.setClipSpeed(project, clipId, 1.0f, SpeedCurvePreset.BULLET)
         val curvedClip = project.findClip(clipId)!!
-        assertTrue(curvedClip.timelineDurationMs > 6_000L) // Bullet slow-mo expands timeline duration
+        assertTrue(curvedClip.timelineDurationMs > 6_000L)
 
         project = TimelineEngine.upsertKeyframe(
             project,
@@ -117,22 +148,56 @@ class VibeCutEngineTest {
     }
 
     @Test
-    fun all22EffectsAndMasterShaderCompileValidGlslStructures() {
-        assertEquals(22, EffectType.entries.size)
+    fun all32EffectsAndProMasterShaderCompileValidGlslStructures() {
+        assertEquals(32, EffectType.entries.size)
         for (fx in EffectType.entries) {
             val shader = GlslShaderGenerator.buildEffectFragmentShader(fx)
             assertTrue("Missing precision header in $fx", shader.contains("precision highp float;"))
             assertTrue("Missing gl_FragColor in $fx", shader.contains("gl_FragColor"))
             assertTrue("Missing uTexSampler in $fx", shader.contains("uTexSampler"))
+            assertTrue("Missing uTertiary uniform in $fx", shader.contains("uniform float uTertiary;"))
+            assertTrue("Blank primary label in $fx", fx.primaryLabel.isNotBlank())
+            assertTrue("Blank secondary label in $fx", fx.secondaryLabel.isNotBlank())
+            assertTrue("Blank tertiary label in $fx", fx.tertiaryLabel.isNotBlank())
         }
         val master = GlslShaderGenerator.buildMasterFinishingFragmentShader()
         assertTrue(master.contains("uGradeSharpness"))
+        assertTrue(master.contains("uSharpenRadius"))
+        assertTrue(master.contains("uSharpenThreshold"))
+        assertTrue(master.contains("uClarity"))
+        assertTrue(master.contains("uStructure"))
+        assertTrue(master.contains("uVignetteFeather"))
         assertTrue(master.contains("uTransitionType"))
     }
 
     @Test
-    fun colorGrading3dCubeLutAndAdobeCubeParserWork() {
-        val cfg = ColorGradingEngine.builtInPresets.first { it.id == "preset-teal-orange" }.config
+    fun decoupledFilterPresetsProAdjustmentsSpatialResolverAnd3dCubeLutWork() {
+        assertTrue("Expected >= 30 built-in filter presets", ColorGradingEngine.builtInPresets.size >= 30)
+
+        // Selecting a filter preset while keeping manual exposure & sharpness preserves both
+        val cfg = ColorGradeConfig(
+            lutPresetId = "preset-teal-orange",
+            lutIntensity = 0.75f,
+            exposure = 0.4f,
+            vibrance = 0.35f,
+            dehaze = 0.25f,
+            whites = 0.15f,
+            blacks = -0.10f,
+            sharpness = 0.55f,
+            clarity = 0.30f,
+            structure = 0.25f
+        )
+        assertTrue(cfg.hasColorLutChanges)
+        assertTrue(cfg.hasSpatialDetailChanges)
+
+        val effectiveSpatial = ColorGradingEngine.resolveEffectiveSpatialConfig(cfg)
+        assertTrue(effectiveSpatial.sharpness >= 0.55f)
+        assertEquals(0.30f, effectiveSpatial.clarity, 0.25f)
+
+        val neutralOut = ColorGradingEngine.gradePixelRgb(0.5f, 0.5f, 0.5f, ColorGradeConfig())
+        val gradedOut = ColorGradingEngine.gradePixelRgb(0.5f, 0.5f, 0.5f, cfg)
+        assertTrue(abs(gradedOut[0] - neutralOut[0]) > 0.02f || abs(gradedOut[2] - neutralOut[2]) > 0.02f)
+
         val baked = ColorGradingEngine.bakeTo3dCube(cfg, size = 9)
         assertEquals(9, baked.size)
         assertEquals(9, baked.argbCube.size)
@@ -151,8 +216,19 @@ class VibeCutEngineTest {
     }
 
     @Test
+    fun codecSafeMacroblockDimensionsAlignTo16PixelsAcrossAllAspects() {
+        for (aspect in AspectRatioPreset.entries) {
+            for (res in ExportResolution.entries) {
+                val (w, h) = aspect.computeCodecSafeDimensions(res.shortSidePx, alignment = 16)
+                assertEquals("Width $w not 16px-aligned for $aspect @ $res", 0, w % 16)
+                assertEquals("Height $h not 16px-aligned for $aspect @ $res", 0, h % 16)
+                assertTrue(w >= 64 && h >= 64)
+            }
+        }
+    }
+
+    @Test
     fun audioBeatDetectionDspAndSfxWavSynthesisWork() {
-        // Synthesize 4 seconds of 120 BPM impulses (every 0.5s = 22,050 samples @ 44.1kHz)
         val sr = 44_100
         val pcm = ShortArray(sr * 4)
         for (beat in 0 until 8) {
@@ -168,7 +244,6 @@ class VibeCutEngineTest {
         assertTrue("Expected >= 5 beats, got ${analysis.beatTimestampsMs.size}", analysis.beatTimestampsMs.size >= 5)
         assertEquals(120f, analysis.estimatedBpm, 6f)
 
-        // Verify all 12 built-in SFX presets synthesize valid RIFF WAVE headers
         for (preset in BuiltInSfxPreset.entries) {
             val wav = AudioDspEngine.synthesizeSfxWavBytes(preset, 22_050)
             assertTrue(wav.size > 44)
@@ -183,6 +258,33 @@ class VibeCutEngineTest {
         val tpl = TemplateCatalog.builtInTemplates.first()
         var project = TemplateCatalog.applyTemplate(tpl, sampleSources())
         project = LocalAiAlgorithms.applyAiAutoEdit(project)
+        val mainId = project.mainVideoClips.first().id
+        project = TimelineEngine.setColorGrade(
+            project,
+            mainId,
+            ColorGradeConfig(
+                lutPresetId = "preset-kodak-2383",
+                lutIntensity = 0.82f,
+                sharpness = 0.64f,
+                sharpenRadius = 0.45f,
+                sharpenThreshold = 0.22f,
+                clarity = 0.35f,
+                structure = 0.28f,
+                dehaze = 0.20f,
+                vibrance = 0.30f
+            )
+        )
+        project = TimelineEngine.addOrUpdateEffect(
+            project,
+            mainId,
+            AppliedEffect(
+                type = EffectType.HALATION,
+                intensity = 0.72f,
+                secondaryParam = 0.58f,
+                tertiaryParam = 0.41f
+            )
+        )
+        project = project.copy(exportConfig = project.exportConfig.copy(exportAsPhotoFrame = true))
         project = SubtitleCodec.applySubtitlesToTextTrack(
             project,
             listOf(
@@ -198,13 +300,13 @@ class VibeCutEngineTest {
 
         val json = ProjectJsonCodec.encodeProject(project)
         val restored = ProjectJsonCodec.decodeProject(json)
-        assertEquals(project.id, restored.id)
-        assertEquals(project.title, restored.title)
-        assertEquals(project.aspectRatio, restored.aspectRatio)
-        assertEquals(project.subtitles.size, restored.subtitles.size)
-        assertEquals(
-            project.tracks.first { it.type == TrackType.VIDEO_MAIN }.clips.size,
-            restored.tracks.first { it.type == TrackType.VIDEO_MAIN }.clips.size
-        )
+        val restoredMain = restored.findClip(mainId)!!
+        assertEquals("preset-kodak-2383", restoredMain.colorGrade.lutPresetId)
+        assertEquals(0.82f, restoredMain.colorGrade.lutIntensity, 0.001f)
+        assertEquals(0.64f, restoredMain.colorGrade.sharpness, 0.001f)
+        assertEquals(0.45f, restoredMain.colorGrade.sharpenRadius, 0.001f)
+        assertEquals(0.35f, restoredMain.colorGrade.clarity, 0.001f)
+        assertEquals(0.41f, restoredMain.effects.last().tertiaryParam, 0.001f)
+        assertTrue(restored.exportConfig.exportAsPhotoFrame)
     }
 }

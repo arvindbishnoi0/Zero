@@ -63,6 +63,7 @@ fun HomeStudioScreen(
     val templates by viewModel.templates.collectAsState()
     val prefs by viewModel.preferences.collectAsState()
     val galleryItems by viewModel.galleryItems.collectAsState()
+    val importProgress by viewModel.importProgress.collectAsState()
     val cacheBytes by viewModel.cacheSizeBytes.collectAsState()
     val isBusy by viewModel.isBusy.collectAsState()
     val banner by viewModel.statusBanner.collectAsState()
@@ -75,7 +76,15 @@ fun HomeStudioScreen(
     var historyTargetId by remember { mutableStateOf<String?>(null) }
 
     val multiVisualPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickMultipleVisualMedia(20)
+        contract = ActivityResultContracts.PickMultipleVisualMedia(25)
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            viewModel.createProjectWithUris("New Edit", selectedAspect, uris, onOpenEditor)
+        }
+    }
+
+    val universalDocPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
         if (uris.isNotEmpty()) {
             viewModel.createProjectWithUris("New Edit", selectedAspect, uris, onOpenEditor)
@@ -180,7 +189,11 @@ fun HomeStudioScreen(
                     },
                     onOpenNewProjectModal = {
                         val perms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            arrayOf(Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.READ_MEDIA_IMAGES)
+                            arrayOf(
+                                Manifest.permission.READ_MEDIA_VIDEO,
+                                Manifest.permission.READ_MEDIA_IMAGES,
+                                Manifest.permission.READ_MEDIA_AUDIO
+                            )
                         } else {
                             arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
                         }
@@ -219,21 +232,49 @@ fun HomeStudioScreen(
                 )
             }
 
-            if (isBusy) {
+            if (isBusy || importProgress.isImporting) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(Color.Black.copy(alpha = 0.65f)),
+                        .background(Color.Black.copy(alpha = 0.72f)),
                     contentAlignment = Alignment.Center
                 ) {
-                    Card(colors = CardDefaults.cardColors(containerColor = SurfaceElevated)) {
-                        Row(
-                            modifier = Modifier.padding(20.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = SurfaceElevated),
+                        shape = RoundedCornerShape(18.dp),
+                        modifier = Modifier.padding(horizontal = 28.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(22.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            CircularProgressIndicator(color = ElectricCyan, modifier = Modifier.size(26.dp))
-                            Spacer(Modifier.width(14.dp))
-                            Text("Preparing Studio Timeline...", color = TextPrimary)
+                            CircularProgressIndicator(color = ElectricCyan, modifier = Modifier.size(32.dp))
+                            Text(
+                                text = if (importProgress.isImporting) {
+                                    "Loading ${importProgress.currentIndex}/${importProgress.totalCount}: ${importProgress.currentItemName}"
+                                } else "Preparing Studio Timeline...",
+                                color = TextPrimary,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            if (importProgress.isImporting) {
+                                LinearProgressIndicator(
+                                    progress = { importProgress.fraction },
+                                    color = ElectricCyan,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(6.dp)
+                                        .clip(RoundedCornerShape(50))
+                                )
+                                Text(
+                                    text = importProgress.stageDescription,
+                                    color = TextSecondary,
+                                    fontSize = 11.sp
+                                )
+                            }
                         }
                     }
                 }
@@ -254,7 +295,7 @@ fun HomeStudioScreen(
         }
     }
 
-    // New Project + Device Gallery Picker Sheet
+    // New Project + Universal Media Picker Sheet
     if (showNewProjectSheet) {
         NewProjectPickerSheet(
             initialAspect = selectedAspect,
@@ -267,9 +308,14 @@ fun HomeStudioScreen(
                     PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
                 )
             },
+            onLaunchUniversalFiles = { aspect ->
+                selectedAspect = aspect
+                showNewProjectSheet = false
+                universalDocPicker.launch(arrayOf("video/*", "image/*", "audio/*"))
+            },
             onCreateBlank = { title, aspect ->
                 showNewProjectSheet = false
-                viewModel.createEmptyProject(title, aspect, onOpenEditor)
+                viewModel.createStudioCanvasProject(title, aspect, onCreated = onOpenEditor)
             },
             onCreateFromGallerySelection = { title, aspect, uris ->
                 showNewProjectSheet = false
@@ -921,12 +967,23 @@ private fun NewProjectPickerSheet(
     galleryItems: List<com.vibecut.pro.ui.viewmodel.DeviceGalleryItem>,
     onDismiss: () -> Unit,
     onLaunchSystemPicker: (AspectRatioPreset) -> Unit,
+    onLaunchUniversalFiles: (AspectRatioPreset) -> Unit,
     onCreateBlank: (String, AspectRatioPreset) -> Unit,
     onCreateFromGallerySelection: (String, AspectRatioPreset, List<Uri>) -> Unit
 ) {
     var title by remember { mutableStateOf("My VibeCut Edit") }
     var aspect by remember { mutableStateOf(initialAspect) }
+    var kindFilter by remember { mutableStateOf("ALL") }
     val selectedUris = remember { mutableStateListOf<String>() }
+
+    val filtered = remember(galleryItems, kindFilter) {
+        when (kindFilter) {
+            "VIDEO" -> galleryItems.filter { it.mediaKind == com.vibecut.pro.engine.model.MediaKind.VIDEO }
+            "PHOTO" -> galleryItems.filter { it.mediaKind == com.vibecut.pro.engine.model.MediaKind.IMAGE }
+            "AUDIO" -> galleryItems.filter { it.mediaKind == com.vibecut.pro.engine.model.MediaKind.AUDIO }
+            else -> galleryItems
+        }
+    }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -936,7 +993,7 @@ private fun NewProjectPickerSheet(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 20.dp, vertical = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Text("New Studio Project", style = MaterialTheme.typography.titleLarge)
 
@@ -961,38 +1018,59 @@ private fun NewProjectPickerSheet(
                 }
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Button(
-                    onClick = { onLaunchSystemPicker(aspect) },
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text("System Photo/Video Picker")
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(onClick = { onLaunchSystemPicker(aspect) }) {
+                    Icon(Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Photos & Videos")
                 }
-                OutlinedButton(
-                    onClick = { onCreateBlank(title, aspect) }
-                ) {
-                    Text("Blank Canvas")
+                OutlinedButton(onClick = { onLaunchUniversalFiles(aspect) }) {
+                    Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Browse Files")
+                }
+                OutlinedButton(onClick = { onCreateBlank(title, aspect) }) {
+                    Text("Studio Canvas")
                 }
             }
 
             if (galleryItems.isNotEmpty()) {
-                Text("Device Videos (${galleryItems.size}) — Tap to multi-select:", fontSize = 12.sp, color = TextSecondary)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("ALL" to "All", "VIDEO" to "Videos", "PHOTO" to "Photos", "AUDIO" to "Audio").forEach { (key, lbl) ->
+                        FilterChip(
+                            selected = kindFilter == key,
+                            onClick = { kindFilter = key },
+                            label = { Text(lbl, fontSize = 11.sp) }
+                        )
+                    }
+                }
                 LazyColumn(modifier = Modifier.heightIn(max = 220.dp)) {
-                    items(galleryItems) { item ->
+                    items(filtered, key = { it.uri }) { item ->
                         val isChosen = item.uri in selectedUris
+                        val kindLabel = when (item.mediaKind) {
+                            com.vibecut.pro.engine.model.MediaKind.IMAGE -> "PHOTO"
+                            com.vibecut.pro.engine.model.MediaKind.AUDIO -> "AUDIO • ${formatCompactDuration(item.durationMs)}"
+                            else -> formatCompactDuration(item.durationMs)
+                        }
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clickable {
                                     if (isChosen) selectedUris.remove(item.uri) else selectedUris.add(item.uri)
                                 }
-                                .padding(vertical = 8.dp),
+                                .padding(vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text(item.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                            Text(formatCompactDuration(item.durationMs), fontSize = 11.sp, color = TextSecondary)
-                            Spacer(Modifier.width(8.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(item.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 13.sp)
+                                Text(kindLabel, fontSize = 10.sp, color = ElectricCyan)
+                            }
                             Checkbox(
                                 checked = isChosen,
                                 onCheckedChange = {
@@ -1007,13 +1085,14 @@ private fun NewProjectPickerSheet(
                         onClick = {
                             onCreateFromGallerySelection(title, aspect, selectedUris.map { Uri.parse(it) })
                         },
+                        colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan, contentColor = Color.Black),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("Import ${selectedUris.size} Selected Video(s)")
+                        Text("Import ${selectedUris.size} Selected Media Item(s)", fontWeight = FontWeight.Bold)
                     }
                 }
             }
-            Spacer(Modifier.height(18.dp))
+            Spacer(Modifier.height(16.dp))
         }
     }
 }
