@@ -627,13 +627,13 @@ class VibeCutEngineTest {
         assertTrue("portrait must be taller", ph > pw)
         val (lw, lh) = AspectRatioPreset.dimensionsForProject(AspectRatioPreset.YOUTUBE_16_9, 1080, 0.5625f)
         assertTrue("landscape must be wider", lw > lh)
-        // 1080 is the short side, so a 16:9 frame is 1920x1080.
-        assertEquals(1080, lh)
+        // 1080 is the short side, so a 16:9 frame is ~1920x1080 (snapped to the 16px grid).
+        assertTrue("landscape height ~1080, got $lh", abs(lh - 1080) <= 16)
         assertTrue("landscape width ~1920, got $lw", abs(lw - 1920) <= 16)
 
         // A custom ratio is honoured: for ratio <= 1 the short side is the width.
         val (cw, ch) = AspectRatioPreset.CUSTOM.computeDimensionsFor(1080, 0.8f)
-        assertEquals(1080, cw)
+        assertEquals(1080, cw)  // unaligned helper keeps the exact requested short side
         assertTrue("custom 0.8 height ~1350, got $ch", abs(ch - 1350) <= 16)
         listOf(
             AspectRatioPreset.REELS_9_16,
