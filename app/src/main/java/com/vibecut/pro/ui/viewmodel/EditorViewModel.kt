@@ -750,8 +750,8 @@ class EditorViewModel @Inject constructor(
             type = type,
             enabled = true,
             intensity = type.defaultIntensity,
-            secondaryParam = type.secondaryParam.default,
-            tertiaryParam = type.tertiaryParam.default
+            secondaryParam = type.defaultSecondary,
+            tertiaryParam = type.defaultTertiary
         )
         applyMutation("Add ${type.label}", newSelectedClipId = clip.id) {
             TimelineEngine.addOrUpdateEffect(it, clip.id, effect)
@@ -1258,14 +1258,3 @@ class EditorViewModel @Inject constructor(
     }
 }
 
-/** One item in the device gallery used by the media importer sheet. */
-data class DeviceGalleryItem(
-    val uri: String,
-    val displayName: String,
-    val durationMs: Long,
-    val mediaKind: MediaKind,
-    val width: Int,
-    val height: Int,
-    val sizeBytes: Long,
-    val mimeType: String
-)
