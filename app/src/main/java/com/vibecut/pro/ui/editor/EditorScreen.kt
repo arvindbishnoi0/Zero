@@ -1,14 +1,12 @@
 package com.vibecut.pro.ui.editor
 
-import android.net.Uri
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.PickVisualMediaRequest
-import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -24,15 +22,17 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vibecut.pro.engine.model.AspectRatioPreset
-import com.vibecut.pro.engine.model.KeyframeProperty
 import com.vibecut.pro.engine.model.TrackType
 import com.vibecut.pro.engine.templates.TemplateCategory
+import com.vibecut.pro.ui.editor.components.CompactTimelineStrip
 import com.vibecut.pro.ui.editor.components.MultiTrackTimeline
 import com.vibecut.pro.ui.editor.components.PreviewViewport
+import com.vibecut.pro.ui.editor.components.UniversalMediaImporterSheet
 import com.vibecut.pro.ui.editor.panels.*
 import com.vibecut.pro.ui.theme.*
 import com.vibecut.pro.ui.viewmodel.EditorInspectorTab
 import com.vibecut.pro.ui.viewmodel.EditorViewModel
+import kotlin.math.abs
 
 @Composable
 fun EditorScreen(
@@ -48,28 +48,28 @@ fun EditorScreen(
     val playheadMs by viewModel.playheadMs.collectAsState()
     val isPlaying by viewModel.isPlaying.collectAsState()
     val exportState by viewModel.exportState.collectAsState()
+    val importProgress by viewModel.importProgress.collectAsState()
 
     var pendingImportTrackType by remember { mutableStateOf(TrackType.VIDEO_MAIN) }
     var showExportModal by remember { mutableStateOf(false) }
     var showRenameDialog by remember { mutableStateOf(false) }
     var showSaveTemplateDialog by remember { mutableStateOf(false) }
     var showAspectMenu by remember { mutableStateOf(false) }
+    var forceFullTimelineInStudio by remember { mutableStateOf(false) }
 
-    val visualMediaPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickMultipleVisualMedia(20)
-    ) { uris ->
-        if (uris.isNotEmpty()) {
-            viewModel.importMediaUris(uris, pendingImportTrackType)
-        }
+    val activeVisualClip = remember(uiState.project, uiState.selectedClipId, playheadMs) {
+        uiState.activeVisualClip(playheadMs)
     }
 
-    val audioFilePicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        if (uri != null) {
-            viewModel.importMediaUris(listOf(uri), pendingImportTrackType)
-        }
-    }
+    // Automatically give customization tabs spacious vertical room unless user expanded full tracks
+    val isCustomizationFocusedTab = uiState.activeTab in setOf(
+        EditorInspectorTab.FILTERS,
+        EditorInspectorTab.DETAIL,
+        EditorInspectorTab.ADJUST,
+        EditorInspectorTab.EFFECTS,
+        EditorInspectorTab.AI
+    )
+    val showCompactTimeline = isCustomizationFocusedTab && !forceFullTimelineInStudio
 
     Scaffold(
         containerColor = ObsidianBg,
@@ -79,16 +79,19 @@ fun EditorScreen(
                     .fillMaxWidth()
                     .background(PanelDark)
                     .statusBarsPadding()
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                    .padding(horizontal = 8.dp, vertical = 5.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
-                    IconButton(onClick = {
-                        viewModel.saveImmediately("Exit editor")
-                        onNavigateBack()
-                    }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    IconButton(
+                        onClick = {
+                            viewModel.saveImmediately("Exit editor")
+                            onNavigateBack()
+                        },
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", modifier = Modifier.size(20.dp))
                     }
 
                     Column(
@@ -112,12 +115,22 @@ fun EditorScreen(
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    // Aspect Ratio Selector Chip
+                    // Aspect Ratio Selector
                     Box {
-                        AssistChip(
-                            onClick = { showAspectMenu = true },
-                            label = { Text(uiState.project.aspectRatio.label, fontSize = 11.sp) }
-                        )
+                        Surface(
+                            color = SurfaceElevated,
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, SurfaceStroke),
+                            modifier = Modifier.clickable { showAspectMenu = true }
+                        ) {
+                            Text(
+                                text = uiState.project.aspectRatio.label,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = TextPrimary,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                            )
+                        }
                         DropdownMenu(
                             expanded = showAspectMenu,
                             onDismissRequest = { showAspectMenu = false },
@@ -135,8 +148,13 @@ fun EditorScreen(
                         }
                     }
 
-                    IconButton(onClick = { showSaveTemplateDialog = true }, modifier = Modifier.size(34.dp)) {
-                        Icon(Icons.Default.BookmarkAdd, contentDescription = "Save as Template", tint = KeyframeGold, modifier = Modifier.size(19.dp))
+                    IconButton(onClick = { showSaveTemplateDialog = true }, modifier = Modifier.size(32.dp)) {
+                        Icon(
+                            Icons.Default.BookmarkAdd,
+                            contentDescription = "Save as Template",
+                            tint = KeyframeGold,
+                            modifier = Modifier.size(18.dp)
+                        )
                     }
 
                     Button(
@@ -148,7 +166,7 @@ fun EditorScreen(
                         ),
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                     ) {
-                        Icon(Icons.Default.IosShare, contentDescription = null, modifier = Modifier.size(15.dp))
+                        Icon(Icons.Default.IosShare, contentDescription = null, modifier = Modifier.size(14.dp))
                         Spacer(Modifier.width(4.dp))
                         Text("Export", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
                     }
@@ -156,47 +174,76 @@ fun EditorScreen(
             }
         },
         bottomBar = {
-            // 8-Tab Professional Studio Tool Dock
+            // Redesigned 10-Tab Pro Studio Tool Dock with Active Edit Indicators
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(PanelDark)
                     .navigationBarsPadding()
                     .horizontalScroll(rememberScrollState())
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    .padding(horizontal = 8.dp, vertical = 5.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
+                val g = activeVisualClip?.colorGrade
                 EditorInspectorTab.entries.forEach { tab ->
                     val selected = uiState.activeTab == tab
                     val icon = when (tab) {
-                        EditorInspectorTab.EDIT -> Icons.Default.Tune
+                        EditorInspectorTab.EDIT -> Icons.Default.ContentCut
+                        EditorInspectorTab.FILTERS -> Icons.Default.FilterVintage
+                        EditorInspectorTab.DETAIL -> Icons.Default.Deblur
+                        EditorInspectorTab.ADJUST -> Icons.Default.Tune
                         EditorInspectorTab.EFFECTS -> Icons.Default.AutoFixHigh
-                        EditorInspectorTab.COLOR -> Icons.Default.Palette
                         EditorInspectorTab.TRANSITIONS -> Icons.Default.SwapHoriz
-                        EditorInspectorTab.KEYFRAMES -> Icons.Default.Diamond
                         EditorInspectorTab.AUDIO -> Icons.Default.GraphicEq
                         EditorInspectorTab.TEXT -> Icons.Default.Title
+                        EditorInspectorTab.KEYFRAMES -> Icons.Default.Diamond
                         EditorInspectorTab.AI -> Icons.Default.AutoAwesome
                     }
-                    Row(
+                    val hasActiveBadge = when (tab) {
+                        EditorInspectorTab.FILTERS -> g?.lutPresetId != null || !g?.customCubeLutUri.isNullOrBlank()
+                        EditorInspectorTab.DETAIL -> g != null && (g.hasSpatialDetailChanges || abs(g.dehaze) > 0.01f)
+                        EditorInspectorTab.ADJUST -> g != null && (
+                            abs(g.exposure) > 0.01f || abs(g.contrast) > 0.01f ||
+                                abs(g.saturation) > 0.01f || abs(g.vibrance) > 0.01f ||
+                                abs(g.temperature) > 0.01f || !g.curves.isIdentity || !g.colorWheels.isIdentity
+                            )
+                        EditorInspectorTab.EFFECTS -> activeVisualClip?.effects?.any { it.enabled } == true
+                        EditorInspectorTab.TRANSITIONS -> activeVisualClip?.transitionIn != null
+                        EditorInspectorTab.KEYFRAMES -> uiState.selectedClip?.keyframes?.isNotEmpty() == true
+                        else -> false
+                    }
+
+                    Column(
                         modifier = Modifier
                             .clip(RoundedCornerShape(10.dp))
-                            .background(if (selected) ElectricCyan.copy(alpha = 0.18f) else Color.Transparent)
+                            .background(if (selected) ElectricCyan.copy(alpha = 0.16f) else Color.Transparent)
                             .clickable { viewModel.selectTab(tab) }
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                            .padding(horizontal = 11.dp, vertical = 6.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Icon(
-                            icon,
-                            contentDescription = tab.label,
-                            tint = if (selected) ElectricCyan else TextSecondary,
-                            modifier = Modifier.size(16.dp)
-                        )
+                        Box {
+                            Icon(
+                                icon,
+                                contentDescription = tab.label,
+                                tint = if (selected) ElectricCyan else TextSecondary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            if (hasActiveBadge) {
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .offset(x = 3.dp, y = (-2).dp)
+                                        .size(6.dp)
+                                        .clip(CircleShape)
+                                        .background(KeyframeGold)
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(2.dp))
                         Text(
                             text = tab.label,
-                            fontSize = 11.sp,
-                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                            fontSize = 10.sp,
+                            fontWeight = if (selected) FontWeight.ExtraBold else FontWeight.Medium,
                             color = if (selected) ElectricCyan else TextSecondary
                         )
                     }
@@ -210,29 +257,26 @@ fun EditorScreen(
                 .padding(innerPadding)
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
-                // 1. Live OpenGL ES Video Preview + Interactive Overlay Gizmo (36% height)
+                // 1. Live GPU OpenGL Preview Stage
                 PreviewViewport(
                     exoPlayer = viewModel.previewController.videoPlayer,
                     project = uiState.project,
                     playheadMs = playheadMs,
                     isPlaying = isPlaying,
                     selectedClip = uiState.selectedClip,
+                    isCompareOriginal = uiState.isCompareOriginal,
                     canUndo = uiState.canUndo,
                     canRedo = uiState.canRedo,
                     onTogglePlay = viewModel::togglePlayPause,
                     onStepFrames = viewModel::stepFrames,
+                    onToggleCompare = viewModel::toggleCompareOriginal,
                     onQuickSplit = viewModel::splitSelectedAtPlayhead,
-                    onQuickKeyframe = {
-                        val c = uiState.selectedClip
-                        if (c != null) {
-                            viewModel.upsertKeyframeAtPlayhead(KeyframeProperty.SCALE, c.transform.scaleX)
-                        }
-                    },
+                    onQuickSnapshot = viewModel::quickCaptureGradedPhotoFrame,
                     onUndo = viewModel::undo,
                     onRedo = viewModel::redo,
-                    onImportMediaClick = {
+                    onOpenMediaHub = {
                         pendingImportTrackType = TrackType.VIDEO_MAIN
-                        visualMediaPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+                        viewModel.setShowMediaImporterSheet(true)
                     },
                     onGenerateDemoClick = viewModel::generateAndImportSampleClips,
                     onDragSelectedOverlay = { dxNdc, dyNdc ->
@@ -245,61 +289,80 @@ fun EditorScreen(
                             )
                         )
                     },
-                    modifier = Modifier.weight(0.36f)
+                    modifier = Modifier.weight(if (showCompactTimeline) 0.43f else 0.36f)
                 )
 
-                // 2. Multi-Layer VN-Style Magnetic Timeline (30% height)
-                MultiTrackTimeline(
-                    project = uiState.project,
-                    playheadMs = playheadMs,
-                    selectedClipId = uiState.selectedClip?.id,
-                    onSelectClip = viewModel::selectClip,
-                    onSeekMs = viewModel::seekTo,
-                    onZoomChange = viewModel::setTimelineZoom,
-                    onToggleTrackLock = viewModel::toggleTrackLock,
-                    onToggleTrackHidden = viewModel::toggleTrackHidden,
-                    onToggleTrackMute = viewModel::toggleTrackMute,
-                    onOpenTransitionInspector = { clipId ->
-                        viewModel.selectClip(clipId)
-                        viewModel.selectTab(EditorInspectorTab.TRANSITIONS)
-                    },
-                    onImportClipToTrack = { trackType ->
-                        pendingImportTrackType = trackType
-                        when (trackType) {
-                            TrackType.TEXT -> viewModel.addTextClip()
-                            TrackType.STICKER -> viewModel.selectTab(EditorInspectorTab.TEXT)
-                            TrackType.AUDIO_MUSIC, TrackType.AUDIO_VOICEOVER, TrackType.AUDIO_SFX ->
-                                audioFilePicker.launch("audio/*")
-                            else ->
-                                visualMediaPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+                // 2. Adaptive Timeline (Compact Strip in Customization Studio OR Full Multi-Track Timeline)
+                if (showCompactTimeline) {
+                    CompactTimelineStrip(
+                        project = uiState.project,
+                        playheadMs = playheadMs,
+                        selectedClipId = activeVisualClip?.id ?: uiState.selectedClip?.id,
+                        onSelectClip = viewModel::selectClip,
+                        onSeekMs = viewModel::seekTo,
+                        onExpandTimeline = { forceFullTimelineInStudio = true },
+                        onOpenMediaHub = {
+                            pendingImportTrackType = TrackType.VIDEO_MAIN
+                            viewModel.setShowMediaImporterSheet(true)
                         }
-                    },
-                    modifier = Modifier.weight(0.30f)
-                )
+                    )
+                } else {
+                    MultiTrackTimeline(
+                        project = uiState.project,
+                        playheadMs = playheadMs,
+                        selectedClipId = uiState.selectedClip?.id,
+                        onSelectClip = viewModel::selectClip,
+                        onSeekMs = viewModel::seekTo,
+                        onZoomChange = viewModel::setTimelineZoom,
+                        onToggleTrackLock = viewModel::toggleTrackLock,
+                        onToggleTrackHidden = viewModel::toggleTrackHidden,
+                        onToggleTrackMute = viewModel::toggleTrackMute,
+                        onOpenTransitionInspector = { clipId ->
+                            viewModel.selectClip(clipId)
+                            viewModel.selectTab(EditorInspectorTab.TRANSITIONS)
+                        },
+                        onImportClipToTrack = { trackType ->
+                            when (trackType) {
+                                TrackType.TEXT -> viewModel.addTextClip()
+                                TrackType.STICKER -> viewModel.selectTab(EditorInspectorTab.TEXT)
+                                else -> {
+                                    pendingImportTrackType = trackType
+                                    viewModel.setShowMediaImporterSheet(true)
+                                }
+                            }
+                        },
+                        onCollapseTimeline = if (isCustomizationFocusedTab) {
+                            { forceFullTimelineInStudio = false }
+                        } else null,
+                        modifier = Modifier.weight(0.28f)
+                    )
+                }
 
                 HorizontalDivider(color = SurfaceStroke)
 
-                // 3. Active Tool Studio Inspector Panel (34% height)
+                // 3. Spacious Customization & Studio Inspector Panel
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .weight(0.34f)
+                        .weight(if (showCompactTimeline) 0.57f else 0.36f)
                         .background(ObsidianBg)
                 ) {
                     when (uiState.activeTab) {
                         EditorInspectorTab.EDIT -> ClipEditPanel(uiState.selectedClip, uiState.project, viewModel)
-                        EditorInspectorTab.EFFECTS -> EffectsStudioPanel(uiState.selectedClip, viewModel)
-                        EditorInspectorTab.COLOR -> ColorGradingPanel(uiState.selectedClip, uiState.project, viewModel)
-                        EditorInspectorTab.TRANSITIONS -> TransitionsPanel(uiState.selectedClip, viewModel)
-                        EditorInspectorTab.KEYFRAMES -> KeyframesPanel(uiState.selectedClip, playheadMs, viewModel)
+                        EditorInspectorTab.FILTERS -> FilterStudioPanel(activeVisualClip, uiState.project, viewModel)
+                        EditorInspectorTab.DETAIL -> DetailAndSharpenPanel(activeVisualClip, uiState.project, viewModel)
+                        EditorInspectorTab.ADJUST -> ColorGradingPanel(activeVisualClip, uiState.project, viewModel)
+                        EditorInspectorTab.EFFECTS -> EffectsStudioPanel(activeVisualClip, viewModel)
+                        EditorInspectorTab.TRANSITIONS -> TransitionsPanel(activeVisualClip, viewModel)
                         EditorInspectorTab.AUDIO -> AudioStudioPanel(uiState, viewModel)
                         EditorInspectorTab.TEXT -> TextAndCaptionsPanel(uiState, viewModel)
+                        EditorInspectorTab.KEYFRAMES -> KeyframesPanel(uiState.selectedClip ?: activeVisualClip, playheadMs, viewModel)
                         EditorInspectorTab.AI -> AiToolsStudioPanel(uiState, viewModel)
                     }
                 }
             }
 
-            // Toast notification banner
+            // Toast notification pill
             uiState.toastMessage?.let { msg ->
                 LaunchedEffect(msg) {
                     kotlinx.coroutines.delay(2400L)
@@ -309,6 +372,7 @@ fun EditorScreen(
                     color = SurfaceElevated,
                     shape = RoundedCornerShape(50),
                     shadowElevation = 6.dp,
+                    border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.4f)),
                     modifier = Modifier
                         .align(Alignment.TopCenter)
                         .padding(top = 10.dp)
@@ -323,6 +387,24 @@ fun EditorScreen(
                 }
             }
         }
+    }
+
+    // Universal Media Supporter & Loader Sheet
+    if (uiState.showMediaImporterSheet) {
+        UniversalMediaImporterSheet(
+            deviceMedia = uiState.deviceMediaLibrary,
+            importProgress = importProgress,
+            targetTrackType = pendingImportTrackType,
+            onImportUris = { uris, destTrack ->
+                viewModel.importMediaUris(uris, destTrack)
+            },
+            onAddBackdrop = { title, primary, secondary ->
+                viewModel.addStudioCanvasBackdrop(title, primary, secondary)
+            },
+            onGenerateSamples = viewModel::generateAndImportSampleClips,
+            onRefreshLibrary = viewModel::refreshDeviceMediaLibrary,
+            onDismiss = { viewModel.setShowMediaImporterSheet(false) }
+        )
     }
 
     if (showExportModal) {

@@ -180,6 +180,7 @@ object ProjectJsonCodec {
                 "type" to fx.type.name,
                 "intensity" to fx.intensity,
                 "secondary" to fx.secondaryParam,
+                "tertiary" to fx.tertiaryParam,
                 "enabled" to fx.enabled
             )
         },
@@ -201,18 +202,25 @@ object ProjectJsonCodec {
         "stickerSpec" to c.stickerSpec?.let { linkedMapOf("content" to it.content, "label" to it.label, "category" to it.category) },
         "waveformPeaks" to c.waveformPeaks,
         "beatMarkersMs" to c.beatMarkersMs,
-        "upscaleTargetHeight" to c.upscaleTargetHeight
+        "upscaleTargetHeight" to c.upscaleTargetHeight,
+        "hasAudioTrack" to c.hasAudioTrack,
+        "sourceWidth" to c.sourceWidth,
+        "sourceHeight" to c.sourceHeight,
+        "rotationDegreesMeta" to c.rotationDegreesMeta,
+        "mimeType" to c.mimeType,
+        "thumbnailUri" to c.thumbnailUri
     )
 
     private fun decodeClip(o: JsonObj): TimelineClip {
         val cropObj = o.objOrNull("crop")
         val tfObj = o.objOrNull("transform")
+        val decodedKind = runCatching { MediaKind.valueOf(o.str("mediaKind", "VIDEO")) }.getOrDefault(MediaKind.VIDEO)
         return TimelineClip(
             id = o.str("id", "clip"),
             trackId = o.str("trackId", "track-video-main"),
             sourceUri = o.str("sourceUri", ""),
             sourceName = o.str("sourceName", "Clip"),
-            mediaKind = runCatching { MediaKind.valueOf(o.str("mediaKind", "VIDEO")) }.getOrDefault(MediaKind.VIDEO),
+            mediaKind = decodedKind,
             sourceDurationMs = o.long("sourceDurationMs", 5000L),
             startTimeOnTrackMs = o.long("startTimeOnTrackMs", 0L),
             trimStartMs = o.long("trimStartMs", 0L),
@@ -260,6 +268,7 @@ object ProjectJsonCodec {
                     type = type,
                     intensity = fx.float("intensity", type.defaultIntensity),
                     secondaryParam = fx.float("secondary", type.defaultSecondary),
+                    tertiaryParam = fx.float("tertiary", type.defaultTertiary),
                     enabled = fx.bool("enabled", true)
                 )
             },
@@ -290,7 +299,13 @@ object ProjectJsonCodec {
             },
             waveformPeaks = o.list("waveformPeaks").map { (it as? Number)?.toFloat() ?: 0f },
             beatMarkersMs = o.list("beatMarkersMs").map { (it as? Number)?.toLong() ?: 0L },
-            upscaleTargetHeight = o.intOrNull("upscaleTargetHeight")
+            upscaleTargetHeight = o.intOrNull("upscaleTargetHeight"),
+            hasAudioTrack = o.bool("hasAudioTrack", decodedKind != MediaKind.IMAGE),
+            sourceWidth = o.int("sourceWidth", 1080),
+            sourceHeight = o.int("sourceHeight", 1920),
+            rotationDegreesMeta = o.int("rotationDegreesMeta", 0),
+            mimeType = o.str("mimeType", ""),
+            thumbnailUri = o.strOrNull("thumbnailUri")
         )
     }
 
@@ -298,12 +313,26 @@ object ProjectJsonCodec {
         "brightness" to g.brightness,
         "contrast" to g.contrast,
         "saturation" to g.saturation,
+        "vibrance" to g.vibrance,
         "exposure" to g.exposure,
         "temperature" to g.temperature,
         "tint" to g.tint,
+        "hueShift" to g.hueShift,
         "highlights" to g.highlights,
         "shadows" to g.shadows,
+        "whites" to g.whites,
+        "blacks" to g.blacks,
+        "gamma" to g.gamma,
         "sharpness" to g.sharpness,
+        "sharpenRadius" to g.sharpenRadius,
+        "sharpenThreshold" to g.sharpenThreshold,
+        "clarity" to g.clarity,
+        "structure" to g.structure,
+        "dehaze" to g.dehaze,
+        "denoise" to g.denoise,
+        "vignette" to g.vignette,
+        "vignetteFeather" to g.vignetteFeather,
+        "grain" to g.grain,
         "fade" to g.fade,
         "lutPresetId" to g.lutPresetId,
         "customCubeLutUri" to g.customCubeLutUri,
@@ -349,12 +378,26 @@ object ProjectJsonCodec {
             brightness = o.float("brightness", 0f),
             contrast = o.float("contrast", 0f),
             saturation = o.float("saturation", 0f),
+            vibrance = o.float("vibrance", 0f),
             exposure = o.float("exposure", 0f),
             temperature = o.float("temperature", 0f),
             tint = o.float("tint", 0f),
+            hueShift = o.float("hueShift", 0f),
             highlights = o.float("highlights", 0f),
             shadows = o.float("shadows", 0f),
+            whites = o.float("whites", 0f),
+            blacks = o.float("blacks", 0f),
+            gamma = o.float("gamma", 0f),
             sharpness = o.float("sharpness", 0f),
+            sharpenRadius = o.float("sharpenRadius", 0.35f),
+            sharpenThreshold = o.float("sharpenThreshold", 0.12f),
+            clarity = o.float("clarity", 0f),
+            structure = o.float("structure", 0f),
+            dehaze = o.float("dehaze", 0f),
+            denoise = o.float("denoise", 0f),
+            vignette = o.float("vignette", 0f),
+            vignetteFeather = o.float("vignetteFeather", 0.5f),
+            grain = o.float("grain", 0f),
             fade = o.float("fade", 0f),
             lutPresetId = o.strOrNull("lutPresetId"),
             customCubeLutUri = o.strOrNull("customCubeLutUri"),
@@ -460,6 +503,7 @@ object ProjectJsonCodec {
         "name" to p.name,
         "category" to p.category,
         "accentHex" to p.accentHex,
+        "secondaryHex" to p.secondaryHex,
         "isUserCustom" to p.isUserCustom,
         "config" to encodeColorGrade(p.config)
     )
@@ -469,6 +513,7 @@ object ProjectJsonCodec {
         name = o.str("name", "Custom Preset"),
         category = o.str("category", "Custom"),
         accentHex = o.long("accentHex", 0xFF00E5FF),
+        secondaryHex = o.long("secondaryHex", 0xFF1E293B),
         isUserCustom = o.bool("isUserCustom", true),
         config = o.objOrNull("config")?.let { decodeColorGrade(it) } ?: ColorGradeConfig()
     )
@@ -480,6 +525,7 @@ object ProjectJsonCodec {
         "customBitrateMbps" to e.customBitrateMbps,
         "codec" to e.codec.name,
         "audioOnly" to e.audioOnly,
+        "exportAsPhotoFrame" to e.exportAsPhotoFrame,
         "audioBitrateKbps" to e.audioBitrateKbps,
         "saveToGallery" to e.saveToGallery,
         "runInBackground" to e.runInBackground
@@ -496,12 +542,12 @@ object ProjectJsonCodec {
         codec = runCatching { VideoCodecOption.valueOf(o.str("codec", "H264")) }
             .getOrDefault(VideoCodecOption.H264),
         audioOnly = o.bool("audioOnly", false),
+        exportAsPhotoFrame = o.bool("exportAsPhotoFrame", false),
         audioBitrateKbps = o.int("audioBitrateKbps", 192),
         saveToGallery = o.bool("saveToGallery", true),
         runInBackground = o.bool("runInBackground", false)
     )
 
-    // --- Compact, fast recursive JSON parser & emitter ---
     private class JsonObj(val map: Map<String, Any?>) {
         fun str(k: String, def: String): String = (map[k] as? String) ?: def
         fun strOrNull(k: String): String? = map[k] as? String
@@ -612,7 +658,7 @@ object ProjectJsonCodec {
 
             private fun parseMap(): Map<String, Any?> {
                 val map = LinkedHashMap<String, Any?>()
-                pos++ // '{'
+                pos++
                 skipWs()
                 if (pos < s.length && s[pos] == '}') {
                     pos++
@@ -638,7 +684,7 @@ object ProjectJsonCodec {
 
             private fun parseList(): List<Any?> {
                 val list = ArrayList<Any?>()
-                pos++ // '['
+                pos++
                 skipWs()
                 if (pos < s.length && s[pos] == ']') {
                     pos++

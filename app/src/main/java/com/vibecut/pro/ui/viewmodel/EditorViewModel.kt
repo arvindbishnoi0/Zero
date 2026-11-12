@@ -6,9 +6,6 @@ import android.net.Uri
 import androidx.core.content.FileProvider
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.WorkManager
-import androidx.work.workDataOf
 import com.vibecut.pro.ai.OnDeviceSpeechCaptionService
 import com.vibecut.pro.ai.OnDeviceVisionAiService
 import com.vibecut.pro.data.preferences.AppPreferencesRepository
@@ -27,8 +24,9 @@ import com.vibecut.pro.engine.timeline.TimelineSessionManager
 import com.vibecut.pro.media.audio.MediaAudioTools
 import com.vibecut.pro.media.audio.VoiceoverRecorder
 import com.vibecut.pro.media.export.ExportProgressState
-import com.vibecut.pro.media.export.ExportWorker
 import com.vibecut.pro.media.export.VibeCutExportEngine
+import com.vibecut.pro.media.loader.MediaImportProgress
+import com.vibecut.pro.media.loader.MediaSupportManager
 import com.vibecut.pro.media.player.EditorPreviewController
 import com.vibecut.pro.media.sample.DemoClipGenerator
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -44,14 +42,16 @@ import java.util.UUID
 import javax.inject.Inject
 
 enum class EditorInspectorTab(val label: String) {
-    EDIT("Edit"),
+    EDIT("Clip"),
+    FILTERS("Filters"),
+    DETAIL("Sharpen"),
+    ADJUST("Adjust"),
     EFFECTS("Effects"),
-    COLOR("Color"),
     TRANSITIONS("Trans"),
-    KEYFRAMES("Keyframes"),
     AUDIO("Audio"),
     TEXT("Text"),
-    AI("AI Studio")
+    KEYFRAMES("Motion"),
+    AI("AI Magic")
 }
 
 data class EditorUiState(
@@ -62,6 +62,9 @@ data class EditorUiState(
     val canRedo: Boolean = false,
     val undoCount: Int = 0,
     val redoCount: Int = 0,
+    val isCompareOriginal: Boolean = false,
+    val showMediaImporterSheet: Boolean = false,
+    val deviceMediaLibrary: List<DeviceGalleryItem> = emptyList(),
     val isVoiceRecording: Boolean = false,
     val voiceAmplitude: Float = 0f,
     val isProcessingAi: Boolean = false,
@@ -72,7 +75,22 @@ data class EditorUiState(
 ) {
     val selectedClip: TimelineClip?
         get() = selectedClipId?.let { project.findClip(it) }
-            ?: project.tracks.firstOrNull { it.type == TrackType.VIDEO_MAIN }?.clips?.firstOrNull()
+            ?: project.findMainClipAt(0L)
+
+    fun activeVisualClip(playheadMs: Long): TimelineClip? {
+        val sel = selectedClipId?.let { project.findClip(it) }
+        val selTrack = sel?.let { project.findTrackForClip(it.id) }
+        if (sel != null && selTrack != null) {
+            if (selTrack.type == TrackType.VIDEO_PIP || selTrack.type == TrackType.OVERLAY) {
+                return sel
+            }
+            if (selTrack.type == TrackType.VIDEO_MAIN) {
+                val underPlayhead = project.findMainClipAt(playheadMs)
+                return underPlayhead ?: sel
+            }
+        }
+        return project.findMainClipAt(playheadMs)
+    }
 }
 
 @HiltViewModel
@@ -80,6 +98,7 @@ class EditorViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
     private val projectRepository: ProjectRepository,
     private val preferencesRepository: AppPreferencesRepository,
+    private val mediaSupportManager: MediaSupportManager,
     private val mediaAudioTools: MediaAudioTools,
     private val demoClipGenerator: DemoClipGenerator,
     private val visionAiService: OnDeviceVisionAiService,
@@ -100,6 +119,7 @@ class EditorViewModel @Inject constructor(
     val playheadMs: StateFlow<Long> = previewController.playheadMs
     val isPlaying: StateFlow<Boolean> = previewController.isPlaying
     val exportState: StateFlow<ExportProgressState> = exportEngine.exportState
+    val importProgress: StateFlow<MediaImportProgress> = mediaSupportManager.importProgress
 
     private var autosaveJob: Job? = null
     private var voiceMeterJob: Job? = null
@@ -109,8 +129,26 @@ class EditorViewModel @Inject constructor(
         viewModelScope.launch {
             preferencesRepository.preferencesFlow.collect { prefs ->
                 proxyModeEnabled = prefs.lowEndProxyPreview
-                previewController.syncWithProject(session.currentProject, proxyModeEnabled)
+                previewController.syncProject(
+                    project = session.currentProject,
+                    lowResProxy = proxyModeEnabled,
+                    isCompareBypass = _uiState.value.isCompareOriginal
+                )
                 restartAutosaveLoop(prefs.autosaveIntervalSec)
+            }
+        }
+        // Keep selected main clip synchronized when scrubbing across multi-clip timelines
+        viewModelScope.launch {
+            previewController.playheadMs.collect { ms ->
+                val proj = session.currentProject
+                val curSelId = _uiState.value.selectedClipId
+                val curTrack = curSelId?.let { proj.findTrackForClip(it) }
+                if (curSelId == null || curTrack?.type == TrackType.VIDEO_MAIN) {
+                    val clipAtPlayhead = proj.findMainClipAt(ms)
+                    if (clipAtPlayhead != null && clipAtPlayhead.id != curSelId) {
+                        _uiState.update { it.copy(selectedClipId = clipAtPlayhead.id) }
+                    }
+                }
             }
         }
     }
@@ -120,9 +158,13 @@ class EditorViewModel @Inject constructor(
             val loaded = projectRepository.loadProject(projectId)
                 ?: projectRepository.createNewProject("Untitled Edit", AspectRatioPreset.REELS_9_16)
             session.reset(loaded)
-            val defaultSel = loaded.tracks.firstOrNull { it.type == TrackType.VIDEO_MAIN }?.clips?.firstOrNull()?.id
+            val defaultSel = loaded.findMainClipAt(0L)?.id
             publishSessionState(selectedClipId = defaultSel)
-            previewController.syncWithProject(loaded, proxyModeEnabled)
+            previewController.syncProject(
+                project = loaded,
+                lowResProxy = proxyModeEnabled,
+                isCompareBypass = _uiState.value.isCompareOriginal
+            )
         }
     }
 
@@ -154,9 +196,30 @@ class EditorViewModel @Inject constructor(
     ) {
         val next = session.execute(actionLabel, transform)
         val validSelection = newSelectedClipId?.takeIf { next.findClip(it) != null }
-            ?: next.tracks.firstOrNull { it.type == TrackType.VIDEO_MAIN }?.clips?.firstOrNull()?.id
+            ?: next.findMainClipAt(playheadMs.value)?.id
         publishSessionState(selectedClipId = validSelection)
-        previewController.syncWithProject(next, proxyModeEnabled)
+        previewController.syncProject(
+            project = next,
+            lowResProxy = proxyModeEnabled,
+            isCompareBypass = _uiState.value.isCompareOriginal
+        )
+    }
+
+    private fun applyCoalescedMutation(
+        coalesceKey: String,
+        actionLabel: String,
+        newSelectedClipId: String? = _uiState.value.selectedClipId,
+        transform: (Project) -> Project
+    ) {
+        val next = session.executeCoalesced(coalesceKey, actionLabel, windowMs = 650L, transform = transform)
+        val validSelection = newSelectedClipId?.takeIf { next.findClip(it) != null }
+            ?: next.findMainClipAt(playheadMs.value)?.id
+        publishSessionState(selectedClipId = validSelection)
+        previewController.syncProject(
+            project = next,
+            lowResProxy = proxyModeEnabled,
+            isCompareBypass = _uiState.value.isCompareOriginal
+        )
     }
 
     private fun publishSessionState(selectedClipId: String? = _uiState.value.selectedClipId) {
@@ -172,12 +235,87 @@ class EditorViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Resolves the visual clip currently visible at [playheadMs] (or selected PIP/Overlay clip),
+     * auto-switching selection away from Audio/Text/Sticker tracks so Filter/Sharpen/Adjust/Effect
+     * edits ALWAYS apply visibly to the active video or photo frame!
+     */
+    private fun resolveTargetVisualClip(): TimelineClip? {
+        val target = _uiState.value.activeVisualClip(playheadMs.value) ?: return null
+        if (_uiState.value.selectedClipId != target.id) {
+            _uiState.update { it.copy(selectedClipId = target.id) }
+        }
+        return target
+    }
+
     fun selectClip(clipId: String?) {
         _uiState.update { it.copy(selectedClipId = clipId) }
+        if (clipId != null) {
+            val clip = session.currentProject.findClip(clipId)
+            val track = session.currentProject.findTrackForClip(clipId)
+            if (clip != null && track?.type == TrackType.VIDEO_MAIN) {
+                val curMs = playheadMs.value
+                if (curMs < clip.startTimeOnTrackMs || curMs >= clip.endTimeOnTrackMs) {
+                    previewController.seekToTimelineMs(clip.startTimeOnTrackMs + 10L)
+                }
+            }
+        }
     }
 
     fun selectTab(tab: EditorInspectorTab) {
         _uiState.update { it.copy(activeTab = tab) }
+        val visualTabs = setOf(
+            EditorInspectorTab.FILTERS,
+            EditorInspectorTab.DETAIL,
+            EditorInspectorTab.ADJUST,
+            EditorInspectorTab.EFFECTS,
+            EditorInspectorTab.TRANSITIONS
+        )
+        if (tab in visualTabs) {
+            resolveTargetVisualClip()
+        }
+    }
+
+    fun setCompareOriginal(compareBypass: Boolean) {
+        _uiState.update { it.copy(isCompareOriginal = compareBypass) }
+        previewController.syncProject(
+            project = session.currentProject,
+            lowResProxy = proxyModeEnabled,
+            isCompareBypass = compareBypass
+        )
+    }
+
+    fun toggleCompareOriginal() {
+        setCompareOriginal(!_uiState.value.isCompareOriginal)
+    }
+
+    fun setShowMediaImporterSheet(visible: Boolean) {
+        _uiState.update { it.copy(showMediaImporterSheet = visible) }
+        if (visible) {
+            refreshDeviceMediaLibrary()
+        }
+    }
+
+    fun refreshDeviceMediaLibrary() {
+        viewModelScope.launch {
+            val entries = mediaSupportManager.scanDeviceMediaLibrary(maxPerCategory = 45)
+            _uiState.update { state ->
+                state.copy(
+                    deviceMediaLibrary = entries.map { e ->
+                        DeviceGalleryItem(
+                            uri = e.uri,
+                            displayName = e.displayName,
+                            durationMs = e.durationMs,
+                            mediaKind = e.mediaKind,
+                            width = e.width,
+                            height = e.height,
+                            sizeBytes = e.sizeBytes,
+                            mimeType = e.mimeType
+                        )
+                    }
+                )
+            }
+        }
     }
 
     fun clearToast() {
@@ -195,15 +333,15 @@ class EditorViewModel @Inject constructor(
     // --- Undo / Redo & Transport ---
     fun undo() {
         val prev = session.undo() ?: return
-        publishSessionState()
-        previewController.syncWithProject(prev, proxyModeEnabled)
+        publishSessionState(selectedClipId = prev.findMainClipAt(playheadMs.value)?.id)
+        previewController.syncProject(prev, proxyModeEnabled, _uiState.value.isCompareOriginal)
         notifyToast("Undo")
     }
 
     fun redo() {
         val next = session.redo() ?: return
-        publishSessionState()
-        previewController.syncWithProject(next, proxyModeEnabled)
+        publishSessionState(selectedClipId = next.findMainClipAt(playheadMs.value)?.id)
+        previewController.syncProject(next, proxyModeEnabled, _uiState.value.isCompareOriginal)
         notifyToast("Redo")
     }
 
@@ -224,13 +362,15 @@ class EditorViewModel @Inject constructor(
     }
 
     fun setTimelineZoom(zoom: Float) {
-        val next = TimelineEngine.setTimelineZoom(session.currentProject, zoom)
-        session.execute("Zoom") { next }
-        publishSessionState()
+        applyCoalescedMutation("timeline_zoom", "Zoom") {
+            TimelineEngine.setTimelineZoom(it, zoom)
+        }
     }
 
     fun setAspectRatio(preset: AspectRatioPreset) {
-        applyMutation("Aspect Ratio ${preset.label}") { it.copy(aspectRatio = preset) }
+        applyMutation("Aspect Ratio ${preset.label}") {
+            TimelineEngine.setProjectAspectRatio(it, preset)
+        }
     }
 
     fun renameProject(newTitle: String) {
@@ -247,42 +387,63 @@ class EditorViewModel @Inject constructor(
         applyMutation("Toggle Snapping") { it.copy(snappingEnabled = !it.snappingEnabled) }
     }
 
-    // --- Media Import & Sample Generation ---
+    // --- Universal Media Supporter & Loader (Video, Photo, Audio, Studio Backdrops) ---
     fun importMediaUris(uris: List<Uri>, targetTrackType: TrackType = TrackType.VIDEO_MAIN) {
         if (uris.isEmpty()) return
         viewModelScope.launch {
-            // Take persistable read permission when offered by Android Photo Picker / SAF
-            for (u in uris) {
-                runCatching {
-                    context.contentResolver.takePersistableUriPermission(
-                        u,
-                        Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    )
+            val forceAudio = targetTrackType.isAudioTrack
+            val batch = mediaSupportManager.importMediaBatch(uris, forceAudio = forceAudio)
+            if (batch.imported.isEmpty()) {
+                notifyToast(batch.failures.firstOrNull() ?: "Unsupported or unreadable media file")
+                return@launch
+            }
+
+            val visualItems = batch.imported.filter { it.mediaKind != MediaKind.AUDIO }
+            val audioItems = batch.imported.filter { it.mediaKind == MediaKind.AUDIO }
+
+            var newlyAddedMainClipId: String? = null
+            applyMutation("Import ${batch.imported.size} Media") { proj ->
+                var working = proj
+                if (visualItems.isNotEmpty()) {
+                    val destTrack = if (targetTrackType.isVisualTrack) targetTrackType else TrackType.VIDEO_MAIN
+                    working = TimelineEngine.importMediaClips(working, visualItems, destTrack, playheadMs.value)
+                    newlyAddedMainClipId = working.mainVideoClips.lastOrNull()?.id
                 }
+                if (audioItems.isNotEmpty()) {
+                    val destAudioTrack = if (targetTrackType.isAudioTrack) targetTrackType else TrackType.AUDIO_MUSIC
+                    working = TimelineEngine.importMediaClips(working, audioItems, destAudioTrack, playheadMs.value)
+                }
+                working
             }
-            val sources = uris.map {
-                HomeViewModel.inspectMediaUri(context, it, forceAudio = targetTrackType.isAudio && !targetTrackType.isVisual)
-            }
-            applyMutation("Import Media") { proj ->
-                TimelineEngine.importMediaClips(proj, sources, targetTrackType, playheadMs.value)
+            if (newlyAddedMainClipId != null) {
+                selectClip(newlyAddedMainClipId)
             }
             saveImmediately()
+            val summaryMsg = if (batch.failures.isEmpty()) {
+                "Imported ${batch.imported.size} media item(s)"
+            } else {
+                "Imported ${batch.imported.size} (${batch.failures.size} skipped)"
+            }
+            notifyToast(summaryMsg)
+            _uiState.update { it.copy(showMediaImporterSheet = false) }
 
-            // Asynchronously extract real PCM waveforms & beats for imported clips
-            for (src in sources) {
-                if (src.mediaKind == MediaKind.VIDEO || src.mediaKind == MediaKind.AUDIO) {
-                    val audioSummary = mediaAudioTools.analyzeAudioTrack(src.uri, maxDecodedSeconds = 45)
-                    val matchingClip = session.currentProject.tracks
-                        .flatMap { it.clips }
-                        .lastOrNull { it.sourceUri == src.uri && it.waveformPeaks.isEmpty() }
-                    if (matchingClip != null) {
-                        applyMutation("Waveform Analysis") { proj ->
-                            TimelineEngine.updateClip(proj, matchingClip.id) { c ->
+            // Background beat & detailed waveform enrichment for long video/audio tracks
+            for (src in batch.imported) {
+                if (src.hasAudioTrack && (src.mediaKind == MediaKind.VIDEO || src.mediaKind == MediaKind.AUDIO)) {
+                    runCatching {
+                        val audioSummary = mediaAudioTools.analyzeAudioTrack(src.uri, maxDecodedSeconds = 45)
+                        val matchingClip = session.currentProject.tracks
+                            .flatMap { it.clips }
+                            .lastOrNull { it.sourceUri == src.uri && it.beatMarkersMs.isEmpty() }
+                        if (matchingClip != null && audioSummary.beatAnalysis.peakEnvelope.isNotEmpty()) {
+                            val updated = TimelineEngine.updateClip(session.currentProject, matchingClip.id) { c ->
                                 c.copy(
                                     waveformPeaks = audioSummary.beatAnalysis.peakEnvelope,
                                     beatMarkersMs = audioSummary.beatAnalysis.beatTimestampsMs
                                 )
                             }
+                            session.executeCoalesced("waveform_${matchingClip.id}", "Waveform Analysis") { updated }
+                            publishSessionState()
                         }
                     }
                 }
@@ -292,19 +453,45 @@ class EditorViewModel @Inject constructor(
 
     fun generateAndImportSampleClips() {
         viewModelScope.launch {
-            notifyToast("Encoding H.264 sample clips...")
+            notifyToast("Generating studio H.264 sample clips...")
             val samples = demoClipGenerator.generateSampleVideoClips()
             applyMutation("Add Sample Clips") { proj ->
                 TimelineEngine.importMediaClips(proj, samples, TrackType.VIDEO_MAIN)
             }
             saveImmediately("Added sample clips")
-            notifyToast("Added ${samples.size} sample clips!")
+            notifyToast("Added ${samples.size} studio sample clips!")
+            _uiState.update { it.copy(showMediaImporterSheet = false) }
+        }
+    }
+
+    fun addStudioCanvasBackdrop(
+        title: String,
+        primaryColorArgb: Int,
+        secondaryColorArgb: Int,
+        durationMs: Long = 4_500L
+    ) {
+        viewModelScope.launch {
+            val dims = session.currentProject.aspectRatio.computeCodecSafeDimensions(720)
+            val canvasClip = demoClipGenerator.generateStudioCanvasClip(
+                title = title,
+                primaryColorArgb = primaryColorArgb,
+                secondaryColorArgb = secondaryColorArgb,
+                width = dims.first,
+                height = dims.second,
+                durationMs = durationMs
+            )
+            applyMutation("Add '$title' Backdrop") { proj ->
+                TimelineEngine.importMediaClips(proj, listOf(canvasClip), TrackType.VIDEO_MAIN, playheadMs.value)
+            }
+            saveImmediately()
+            notifyToast("Added '$title' backdrop (${durationMs / 1000f}s)")
+            _uiState.update { it.copy(showMediaImporterSheet = false) }
         }
     }
 
     // --- Core Clip Editing Operations ---
     fun splitSelectedAtPlayhead() {
-        val clip = _uiState.value.selectedClip ?: return
+        val clip = _uiState.value.selectedClip ?: resolveTargetVisualClip() ?: return
         val beforeCount = session.currentProject.findTrackForClip(clip.id)?.clips?.size ?: 0
         applyMutation("Split Clip") { TimelineEngine.splitClipAt(it, clip.id, playheadMs.value) }
         val afterCount = session.currentProject.findTrackForClip(clip.id)?.clips?.size ?: 0
@@ -314,14 +501,30 @@ class EditorViewModel @Inject constructor(
     }
 
     fun trimSelectedClip(newTrimStartMs: Long, newTrimEndMs: Long) {
-        val clip = _uiState.value.selectedClip ?: return
-        applyMutation("Trim Clip") {
+        val clip = _uiState.value.selectedClip ?: resolveTargetVisualClip() ?: return
+        applyCoalescedMutation("trim_${clip.id}", "Trim Clip") {
             TimelineEngine.trimClip(it, clip.id, newTrimStartMs, newTrimEndMs)
         }
     }
 
+    fun setPhotoOrClipDurationMs(targetDurationMs: Long) {
+        val clip = resolveTargetVisualClip() ?: return
+        val clamped = targetDurationMs.coerceIn(300L, clip.sourceDurationMs.coerceAtLeast(15_000L))
+        if (clamped <= clip.sourceDurationMs) {
+            val newEnd = (clip.trimStartMs + clamped).coerceAtMost(clip.sourceDurationMs)
+            applyCoalescedMutation("dur_${clip.id}", "Clip Duration") {
+                TimelineEngine.trimClip(it, clip.id, clip.trimStartMs, newEnd)
+            }
+        } else {
+            val slowFactor = (clip.trimmedSourceDurationMs.toFloat() / clamped.toFloat()).coerceIn(0.15f, 1.0f)
+            applyCoalescedMutation("dur_${clip.id}", "Clip Duration") {
+                TimelineEngine.setClipSpeed(it, clip.id, slowFactor, SpeedCurvePreset.NONE, emptyList())
+            }
+        }
+    }
+
     fun cutMiddleTwentyPercentOfSelected() {
-        val clip = _uiState.value.selectedClip ?: return
+        val clip = _uiState.value.selectedClip ?: resolveTargetVisualClip() ?: return
         val dur = clip.timelineDurationMs
         if (dur < 800L) {
             notifyToast("Clip too short to cut middle")
@@ -335,7 +538,7 @@ class EditorViewModel @Inject constructor(
     }
 
     fun duplicateSelectedClip() {
-        val clip = _uiState.value.selectedClip ?: return
+        val clip = _uiState.value.selectedClip ?: resolveTargetVisualClip() ?: return
         applyMutation("Duplicate Clip") { TimelineEngine.duplicateClip(it, clip.id) }
     }
 
@@ -347,7 +550,7 @@ class EditorViewModel @Inject constructor(
     }
 
     fun moveSelectedClipOrder(delta: Int) {
-        val clip = _uiState.value.selectedClip ?: return
+        val clip = _uiState.value.selectedClip ?: resolveTargetVisualClip() ?: return
         val track = session.currentProject.findTrackForClip(clip.id) ?: return
         val idx = track.clips.indexOfFirst { it.id == clip.id }
         val target = (idx + delta).coerceIn(0, track.clips.lastIndex)
@@ -381,33 +584,45 @@ class EditorViewModel @Inject constructor(
     }
 
     fun setCropOnSelected(cropRect: CropRect) {
-        val clip = _uiState.value.selectedClip ?: return
-        applyMutation("Crop Clip") { TimelineEngine.setCrop(it, clip.id, cropRect) }
+        val clip = resolveTargetVisualClip() ?: return
+        applyCoalescedMutation("crop_${clip.id}", "Crop Clip", newSelectedClipId = clip.id) {
+            TimelineEngine.setCrop(it, clip.id, cropRect)
+        }
     }
 
     fun rotateSelected90(clockwise: Boolean = true) {
-        val clip = _uiState.value.selectedClip ?: return
-        applyMutation("Rotate 90°") { TimelineEngine.rotateClip90(it, clip.id, clockwise) }
+        val clip = resolveTargetVisualClip() ?: return
+        applyMutation("Rotate 90°", newSelectedClipId = clip.id) {
+            TimelineEngine.rotateClip90(it, clip.id, clockwise)
+        }
     }
 
     fun flipSelectedHorizontal() {
-        val clip = _uiState.value.selectedClip ?: return
-        applyMutation("Flip Horizontal") { TimelineEngine.toggleFlipHorizontal(it, clip.id) }
+        val clip = resolveTargetVisualClip() ?: return
+        applyMutation("Flip Horizontal", newSelectedClipId = clip.id) {
+            TimelineEngine.toggleFlipHorizontal(it, clip.id)
+        }
     }
 
     fun flipSelectedVertical() {
-        val clip = _uiState.value.selectedClip ?: return
-        applyMutation("Flip Vertical") { TimelineEngine.toggleFlipVertical(it, clip.id) }
+        val clip = resolveTargetVisualClip() ?: return
+        applyMutation("Flip Vertical", newSelectedClipId = clip.id) {
+            TimelineEngine.toggleFlipVertical(it, clip.id)
+        }
     }
 
     fun toggleReverseSelected() {
-        val clip = _uiState.value.selectedClip ?: return
-        applyMutation("Toggle Reverse") { TimelineEngine.toggleReverseClip(it, clip.id) }
+        val clip = resolveTargetVisualClip() ?: return
+        applyMutation("Toggle Reverse", newSelectedClipId = clip.id) {
+            TimelineEngine.toggleReverseClip(it, clip.id)
+        }
     }
 
     fun updateSelectedTransform(transform: ClipTransform) {
-        val clip = _uiState.value.selectedClip ?: return
-        applyMutation("Transform Clip") { TimelineEngine.setClipTransform(it, clip.id, transform) }
+        val clip = _uiState.value.selectedClip ?: resolveTargetVisualClip() ?: return
+        applyCoalescedMutation("transform_${clip.id}", "Transform Clip", newSelectedClipId = clip.id) {
+            TimelineEngine.setClipTransform(it, clip.id, transform)
+        }
     }
 
     fun updateSelectedSpeed(
@@ -415,15 +630,15 @@ class EditorViewModel @Inject constructor(
         curvePreset: SpeedCurvePreset = SpeedCurvePreset.NONE,
         customPoints: List<SpeedPoint> = emptyList()
     ) {
-        val clip = _uiState.value.selectedClip ?: return
-        applyMutation("Speed ${String.format("%.2fx", speed)}") {
+        val clip = resolveTargetVisualClip() ?: return
+        applyCoalescedMutation("speed_${clip.id}", "Speed ${String.format("%.2fx", speed)}", newSelectedClipId = clip.id) {
             TimelineEngine.setClipSpeed(it, clip.id, speed, curvePreset, customPoints)
         }
     }
 
     fun insertFreezeFrame() {
-        val clip = _uiState.value.selectedClip ?: return
-        applyMutation("Freeze Frame") {
+        val clip = resolveTargetVisualClip() ?: return
+        applyMutation("Freeze Frame", newSelectedClipId = clip.id) {
             TimelineEngine.insertFreezeFrame(it, clip.id, playheadMs.value, 2_000L)
         }
         notifyToast("Inserted 2.0s Freeze Frame")
@@ -446,39 +661,163 @@ class EditorViewModel @Inject constructor(
         applyMutation("Toggle Track Mute") { TimelineEngine.toggleTrackMute(it, trackId) }
     }
 
-    // --- GPU Effects Library (All 22 Effects + Multi-Effect Stack) ---
+    // --- GPU Effects Library (All 32 Effects + 3-Axis Parameter Customization + Multi-Effect Stack) ---
     fun addEffectToSelected(type: EffectType) {
-        val clip = _uiState.value.selectedClip ?: return
-        val fx = AppliedEffect(type = type)
-        applyMutation("Add ${type.label}") { TimelineEngine.addOrUpdateEffect(it, clip.id, fx) }
+        val clip = resolveTargetVisualClip() ?: run {
+            notifyToast("Import a video or photo clip first")
+            return
+        }
+        val existing = clip.effects.firstOrNull { it.type == type }
+        val fx = existing?.copy(enabled = true) ?: AppliedEffect(type = type)
+        applyMutation("Add ${type.label}", newSelectedClipId = clip.id) {
+            TimelineEngine.addOrUpdateEffect(it, clip.id, fx)
+        }
     }
 
     fun updateEffectOnSelected(updated: AppliedEffect) {
-        val clip = _uiState.value.selectedClip ?: return
-        applyMutation("Adjust ${updated.type.label}") {
+        val clip = resolveTargetVisualClip() ?: return
+        applyCoalescedMutation(
+            coalesceKey = "fx_${clip.id}_${updated.id}",
+            actionLabel = "Adjust ${updated.type.label}",
+            newSelectedClipId = clip.id
+        ) {
             TimelineEngine.addOrUpdateEffect(it, clip.id, updated)
         }
     }
 
+    fun reorderEffectOnSelected(effectId: String, delta: Int) {
+        val clip = resolveTargetVisualClip() ?: return
+        applyMutation("Reorder Effect", newSelectedClipId = clip.id) {
+            TimelineEngine.reorderEffect(it, clip.id, effectId, delta)
+        }
+    }
+
     fun removeEffectFromSelected(effectId: String) {
-        val clip = _uiState.value.selectedClip ?: return
-        applyMutation("Remove Effect") { TimelineEngine.removeEffect(it, clip.id, effectId) }
+        val clip = resolveTargetVisualClip() ?: return
+        applyMutation("Remove Effect", newSelectedClipId = clip.id) {
+            TimelineEngine.removeEffect(it, clip.id, effectId)
+        }
     }
 
-    // --- Professional Color Grading ---
-    fun updateColorGradeOnSelected(grade: ColorGradeConfig) {
-        val clip = _uiState.value.selectedClip ?: return
-        applyMutation("Color Grade") { TimelineEngine.setColorGrade(it, clip.id, grade) }
+    fun clearEffectsOnSelected() {
+        val clip = resolveTargetVisualClip() ?: return
+        applyMutation("Clear Effects", newSelectedClipId = clip.id) {
+            TimelineEngine.clearClipEffects(it, clip.id)
+        }
+        notifyToast("Cleared effects on clip")
     }
 
-    fun applyColorPresetOnSelected(preset: ColorGradePreset) {
-        val clip = _uiState.value.selectedClip ?: return
-        val nextCfg = preset.config.copy(lutPresetId = preset.id)
-        applyMutation("Preset ${preset.name}") { TimelineEngine.setColorGrade(it, clip.id, nextCfg) }
+    fun applyEffectsToAllClips() {
+        val clip = resolveTargetVisualClip() ?: return
+        applyMutation("Apply Effects to All Clips", newSelectedClipId = clip.id) {
+            TimelineEngine.applyEffectsToAllMainClips(it, clip.effects)
+        }
+        notifyToast("Applied ${clip.effects.size} effect(s) to all clips")
+    }
+
+    // --- Pro Filters, Sharpen/Detail & Color Grading ---
+    fun updateColorGradeOnSelected(grade: ColorGradeConfig, coalesceKey: String = "grade") {
+        val clip = resolveTargetVisualClip() ?: run {
+            notifyToast("Import a video or photo clip first")
+            return
+        }
+        applyCoalescedMutation(
+            coalesceKey = "${coalesceKey}_${clip.id}",
+            actionLabel = "Adjust Look",
+            newSelectedClipId = clip.id
+        ) {
+            TimelineEngine.setColorGrade(it, clip.id, grade)
+        }
+    }
+
+    /**
+     * Applies or removes any built-in/custom Filter Preset WITHOUT wiping out manual Light, Color,
+     * Sharpness, Detail, HSL, Curves, or Color Wheel adjustments!
+     */
+    fun applyColorPresetOnSelected(preset: ColorGradePreset?) {
+        val clip = resolveTargetVisualClip() ?: run {
+            notifyToast("Import a video or photo clip first")
+            return
+        }
+        val currentStrength = if (clip.colorGrade.lutPresetId == null) 1.0f else clip.colorGrade.lutIntensity.coerceIn(0.15f, 1.0f)
+        val nextCfg = if (preset == null) {
+            clip.colorGrade.copy(lutPresetId = null, customCubeLutUri = null)
+        } else {
+            clip.colorGrade.copy(lutPresetId = preset.id, lutIntensity = currentStrength)
+        }
+        applyMutation(
+            actionLabel = if (preset == null) "Remove Filter" else "Filter '${preset.name}'",
+            newSelectedClipId = clip.id
+        ) {
+            TimelineEngine.setColorGrade(it, clip.id, nextCfg)
+        }
+    }
+
+    fun updateFilterIntensityOnSelected(intensity: Float) {
+        val clip = resolveTargetVisualClip() ?: return
+        val next = clip.colorGrade.copy(lutIntensity = intensity.coerceIn(0f, 1f))
+        updateColorGradeOnSelected(next, coalesceKey = "lut_intensity")
+    }
+
+    fun applyDetailQuickPreset(presetKey: String) {
+        val clip = resolveTargetVisualClip() ?: return
+        val g = clip.colorGrade
+        val next = when (presetKey) {
+            "crisp_hd" -> g.copy(
+                sharpness = 0.42f, sharpenRadius = 0.35f, sharpenThreshold = 0.16f,
+                clarity = 0.22f, structure = 0.18f, denoise = 0.08f
+            )
+            "ultra_4k" -> g.copy(
+                sharpness = 0.68f, sharpenRadius = 0.28f, sharpenThreshold = 0.14f,
+                clarity = 0.36f, structure = 0.42f, dehaze = 0.15f, denoise = 0.10f
+            )
+            "portrait_soft" -> g.copy(
+                sharpness = 0.18f, sharpenRadius = 0.25f, sharpenThreshold = 0.35f,
+                clarity = -0.22f, structure = 0f, denoise = 0.28f
+            )
+            "low_light_clean" -> g.copy(
+                sharpness = 0.24f, sharpenRadius = 0.30f, sharpenThreshold = 0.32f,
+                clarity = 0.12f, structure = 0.08f, denoise = 0.65f
+            )
+            "analog_grain" -> g.copy(
+                sharpness = 0.16f, clarity = 0.10f, vignette = 0.28f,
+                vignetteFeather = 0.65f, grain = 0.36f
+            )
+            else -> g.resetDetailAndOptics()
+        }
+        applyMutation("Detail Preset", newSelectedClipId = clip.id) {
+            TimelineEngine.setColorGrade(it, clip.id, next)
+        }
+    }
+
+    fun resetColorSectionOnSelected(section: String) {
+        val clip = resolveTargetVisualClip() ?: return
+        val g = clip.colorGrade
+        val next = when (section) {
+            "filter" -> g.resetFilter()
+            "light" -> g.resetLight()
+            "color" -> g.resetColor()
+            "detail" -> g.resetDetailAndOptics()
+            "hsl" -> g.copy(hslBands = ColorGradeConfig.defaultHslBands())
+            "curves" -> g.copy(curves = RgbCurvesConfig())
+            "wheels" -> g.copy(colorWheels = ColorWheelsConfig())
+            else -> ColorGradeConfig()
+        }
+        applyMutation("Reset ${section.replaceFirstChar { it.uppercase() }}", newSelectedClipId = clip.id) {
+            TimelineEngine.setColorGrade(it, clip.id, next)
+        }
+    }
+
+    fun applyColorGradeToAllClips() {
+        val clip = resolveTargetVisualClip() ?: return
+        applyMutation("Apply Grade to All Clips", newSelectedClipId = clip.id) {
+            TimelineEngine.applyColorGradeToAllMainClips(it, clip.colorGrade)
+        }
+        notifyToast("Applied filter, sharpen & adjustments to all clips!")
     }
 
     fun importCubeLutUriOnSelected(uri: Uri) {
-        val clip = _uiState.value.selectedClip ?: return
+        val clip = resolveTargetVisualClip() ?: return
         viewModelScope.launch(Dispatchers.IO) {
             val content = runCatching {
                 context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
@@ -496,7 +835,7 @@ class EditorViewModel @Inject constructor(
             val savedFile = File(savedDir, "lut_${System.currentTimeMillis()}.cube")
             savedFile.writeText(content)
             viewModelScope.launch {
-                applyMutation("Import 3D LUT '${valid.title}'") { proj ->
+                applyMutation("Import 3D LUT '${valid.title}'", newSelectedClipId = clip.id) { proj ->
                     TimelineEngine.setColorGrade(
                         proj,
                         clip.id,
@@ -509,24 +848,62 @@ class EditorViewModel @Inject constructor(
     }
 
     fun saveCustomColorPreset(name: String) {
-        val clip = _uiState.value.selectedClip ?: return
+        val clip = resolveTargetVisualClip() ?: return
+        val g = clip.colorGrade
+        // Merge active preset parameters into a standalone custom preset so it never double-applies
+        val activePreset = ColorGradingEngine.findPresetById(g.lutPresetId, session.currentProject.customColorPresets)
+        val mergedConfig = if (activePreset != null) {
+            val s = g.lutIntensity.coerceIn(0f, 1f)
+            val p = activePreset.config
+            g.copy(
+                lutPresetId = null,
+                lutIntensity = 1.0f,
+                exposure = (g.exposure + p.exposure * s).coerceIn(-2f, 2f),
+                brightness = (g.brightness + p.brightness * s).coerceIn(-1f, 1f),
+                contrast = (g.contrast + p.contrast * s).coerceIn(-1f, 1f),
+                saturation = (g.saturation + p.saturation * s).coerceIn(-1f, 1f),
+                vibrance = (g.vibrance + p.vibrance * s).coerceIn(-1f, 1f),
+                temperature = (g.temperature + p.temperature * s).coerceIn(-1f, 1f),
+                tint = (g.tint + p.tint * s).coerceIn(-1f, 1f),
+                highlights = (g.highlights + p.highlights * s).coerceIn(-1f, 1f),
+                shadows = (g.shadows + p.shadows * s).coerceIn(-1f, 1f),
+                whites = (g.whites + p.whites * s).coerceIn(-1f, 1f),
+                blacks = (g.blacks + p.blacks * s).coerceIn(-1f, 1f),
+                dehaze = (g.dehaze + p.dehaze * s).coerceIn(-0.5f, 1f),
+                sharpness = (g.sharpness + p.sharpness * s).coerceIn(0f, 1f),
+                clarity = (g.clarity + p.clarity * s).coerceIn(-1f, 1f),
+                structure = (g.structure + p.structure * s).coerceIn(0f, 1f),
+                vignette = (g.vignette + p.vignette * s).coerceIn(-1f, 1f),
+                grain = (g.grain + p.grain * s).coerceIn(0f, 1f),
+                fade = (g.fade + p.fade * s).coerceIn(0f, 1f)
+            )
+        } else {
+            g.copy(lutPresetId = null, lutIntensity = 1.0f)
+        }
+
         val preset = ColorGradePreset(
             name = name.trim().ifBlank { "My Look" },
             category = "Custom",
             accentHex = 0xFF00E5FF,
-            config = clip.colorGrade,
+            secondaryHex = 0xFF7C4DFF,
+            config = mergedConfig,
             isUserCustom = true
         )
-        applyMutation("Save Color Preset") { proj ->
-            proj.copy(customColorPresets = proj.customColorPresets + preset)
+        applyMutation("Save Custom Look", newSelectedClipId = clip.id) { proj ->
+            val withPreset = proj.copy(customColorPresets = proj.customColorPresets + preset)
+            TimelineEngine.setColorGrade(
+                withPreset,
+                clip.id,
+                ColorGradeConfig(lutPresetId = preset.id, lutIntensity = 1.0f)
+            )
         }
-        notifyToast("Saved preset '${preset.name}'")
+        notifyToast("Saved custom filter '${preset.name}'")
     }
 
     // --- Transitions & Keyframe Animation ---
     fun setTransitionOnSelected(transition: ClipTransition?) {
-        val clip = _uiState.value.selectedClip ?: return
-        applyMutation("Set Transition") {
+        val clip = resolveTargetVisualClip() ?: return
+        applyCoalescedMutation("trans_${clip.id}", "Set Transition", newSelectedClipId = clip.id) {
             TimelineEngine.setClipTransition(it, clip.id, transition, clip.transitionOut)
         }
     }
@@ -543,7 +920,7 @@ class EditorViewModel @Inject constructor(
         value: Float,
         easing: EasingCurve = EasingCurve.EASE_IN_OUT
     ) {
-        val clip = _uiState.value.selectedClip ?: return
+        val clip = _uiState.value.selectedClip ?: resolveTargetVisualClip() ?: return
         val localOffset = (playheadMs.value - clip.startTimeOnTrackMs)
             .coerceIn(0L, clip.timelineDurationMs)
         val kf = Keyframe(
@@ -552,23 +929,23 @@ class EditorViewModel @Inject constructor(
             value = value,
             easing = easing
         )
-        applyMutation("Keyframe ${property.label}") {
+        applyCoalescedMutation("kf_${clip.id}_${property.name}", "Keyframe ${property.label}", newSelectedClipId = clip.id) {
             TimelineEngine.upsertKeyframe(it, clip.id, kf)
         }
     }
 
     fun removeKeyframe(keyframeId: String) {
-        val clip = _uiState.value.selectedClip ?: return
-        applyMutation("Delete Keyframe") {
+        val clip = _uiState.value.selectedClip ?: resolveTargetVisualClip() ?: return
+        applyMutation("Delete Keyframe", newSelectedClipId = clip.id) {
             TimelineEngine.removeKeyframe(it, clip.id, keyframeId)
         }
     }
 
     // --- Audio Studio (Extract Audio, Voiceover, SFX, DSP, Beat Sync) ---
     fun extractAudioFromSelectedClip() {
-        val clip = _uiState.value.selectedClip ?: return
-        if (clip.mediaKind != MediaKind.VIDEO) {
-            notifyToast("Select a video clip to extract audio")
+        val clip = resolveTargetVisualClip() ?: return
+        if (!clip.hasAudioTrack) {
+            notifyToast("This clip has no audio stream to extract")
             return
         }
         viewModelScope.launch {
@@ -583,6 +960,7 @@ class EditorViewModel @Inject constructor(
                 displayName = "${clip.sourceName} (Audio)",
                 mediaKind = MediaKind.AUDIO,
                 durationMs = clip.trimmedSourceDurationMs,
+                hasAudioTrack = true,
                 waveformPeaks = summary.beatAnalysis.peakEnvelope
             )
             applyMutation("Extract Audio") { proj ->
@@ -612,6 +990,7 @@ class EditorViewModel @Inject constructor(
                         displayName = "Voiceover",
                         mediaKind = MediaKind.AUDIO,
                         durationMs = durMs,
+                        hasAudioTrack = true,
                         waveformPeaks = summary.beatAnalysis.peakEnvelope
                     )
                     applyMutation("Record Voiceover") { proj ->
@@ -622,7 +1001,7 @@ class EditorViewModel @Inject constructor(
                             playheadMs.value
                         )
                     }
-                    notifyToast("Added ${durMs / 1000f}s Voiceover")
+                    notifyToast("Added ${String.format("%.1fs", durMs / 1000f)} Voiceover")
                 }
             }
         } else {
@@ -650,6 +1029,7 @@ class EditorViewModel @Inject constructor(
                 displayName = preset.title,
                 mediaKind = MediaKind.GENERATED_SFX,
                 durationMs = preset.durationMs.toLong(),
+                hasAudioTrack = true,
                 waveformPeaks = List(24) { i -> 1f - (i / 24f) * 0.7f }
             )
             applyMutation("Add SFX '${preset.title}'") { proj ->
@@ -665,10 +1045,11 @@ class EditorViewModel @Inject constructor(
         fadeOutMs: Long? = null,
         noiseReduction: Float? = null,
         voiceEnhancement: Float? = null,
-        audioDucking: Boolean? = null
+        audioDucking: Boolean? = null,
+        isMuted: Boolean? = null
     ) {
-        val clip = _uiState.value.selectedClip ?: return
-        applyMutation("Audio Mix") { proj ->
+        val clip = _uiState.value.selectedClip ?: resolveTargetVisualClip() ?: return
+        applyCoalescedMutation("audio_${clip.id}", "Audio Mix") { proj ->
             TimelineEngine.updateClip(proj, clip.id) { c ->
                 c.copy(
                     volume = volume ?: c.volume,
@@ -676,7 +1057,8 @@ class EditorViewModel @Inject constructor(
                     fadeOutMs = fadeOutMs ?: c.fadeOutMs,
                     noiseReduction = noiseReduction ?: c.noiseReduction,
                     voiceEnhancement = voiceEnhancement ?: c.voiceEnhancement,
-                    audioDucking = audioDucking ?: c.audioDucking
+                    audioDucking = audioDucking ?: c.audioDucking,
+                    isMuted = isMuted ?: c.isMuted
                 )
             }
         }
@@ -710,15 +1092,19 @@ class EditorViewModel @Inject constructor(
 
     // --- Text, Stickers & Subtitles (Hindi hi-IN + English en-US) ---
     fun addTextClip(spec: TextStyleSpec = TextStyleSpec()) {
+        var addedId: String? = null
         applyMutation("Add Text") { proj ->
-            TimelineEngine.addTextClip(proj, spec, playheadMs.value, 3_000L)
+            val next = TimelineEngine.addTextClip(proj, spec, playheadMs.value, 3_000L)
+            addedId = next.trackByType(TrackType.TEXT)?.clips?.lastOrNull()?.id
+            next
         }
+        if (addedId != null) selectClip(addedId)
     }
 
     fun updateSelectedTextSpec(spec: TextStyleSpec) {
         val clip = _uiState.value.selectedClip ?: return
         if (clip.textSpec == null) return
-        applyMutation("Edit Text") { proj ->
+        applyCoalescedMutation("text_${clip.id}", "Edit Text", newSelectedClipId = clip.id) { proj ->
             TimelineEngine.updateClip(proj, clip.id) {
                 it.copy(textSpec = spec, sourceName = spec.text.take(24))
             }
@@ -753,7 +1139,7 @@ class EditorViewModel @Inject constructor(
     }
 
     fun generateVadTimedCaptionSlots(languageTag: String) {
-        val mainClip = _uiState.value.selectedClip ?: return
+        val mainClip = resolveTargetVisualClip() ?: return
         viewModelScope.launch {
             notifyToast("Scanning speech activity intervals...")
             val summary = mediaAudioTools.analyzeAudioTrack(mainClip.sourceUri)
@@ -825,23 +1211,23 @@ class EditorViewModel @Inject constructor(
 
     // --- Modular AI Video Editing Suite (All 17 Features) ---
     fun executeAiTool(tool: AiToolType, scriptInput: String = "") {
-        val clip = _uiState.value.selectedClip
+        val clip = resolveTargetVisualClip()
         viewModelScope.launch {
             _uiState.update { it.copy(isProcessingAi = true, aiStatusText = "Running ${tool.title}...") }
             try {
                 when (tool) {
                     AiToolType.AUTO_EDIT -> {
-                        val beats = if (clip != null) {
+                        val beats = if (clip != null && clip.hasAudioTrack) {
                             mediaAudioTools.analyzeAudioTrack(clip.sourceUri).beatAnalysis.beatTimestampsMs
                         } else emptyList()
                         applyMutation("AI Auto Edit") { LocalAiAlgorithms.applyAiAutoEdit(it, beats) }
-                        notifyToast("AI Auto Edit applied color grade, sharpen & transitions")
+                        notifyToast("AI Auto Edit applied filter, sharpen & transitions")
                     }
 
                     AiToolType.SCENE_DETECTION -> {
                         if (clip == null) { notifyToast("Select a video clip first"); return@launch }
                         val (samples, _) = visionAiService.sampleClipFrames(
-                            clip.sourceUri, clip.trimStartMs, clip.trimEndMs, sampleCount = 16, detectFaces = false
+                            clip.sourceUri, clip.trimStartMs, clip.effectiveTrimEndMs, sampleCount = 16, detectFaces = false
                         )
                         val cuts = LocalAiAlgorithms.detectSceneCutTimestamps(samples)
                         if (cuts.isEmpty()) {
@@ -850,8 +1236,8 @@ class EditorViewModel @Inject constructor(
                             applyMutation("AI Scene Split (${cuts.size} cuts)") { proj ->
                                 var working = proj
                                 for (cutOffset in cuts.sortedDescending()) {
-                                    val targetClip = working.tracks.first { it.type == TrackType.VIDEO_MAIN }
-                                        .clips.firstOrNull { (clip.startTimeOnTrackMs + cutOffset) in (it.startTimeOnTrackMs + 150L) until (it.endTimeOnTrackMs - 150L) }
+                                    val targetClip = working.mainVideoClips
+                                        .firstOrNull { (clip.startTimeOnTrackMs + cutOffset) in (it.startTimeOnTrackMs + 150L) until (it.endTimeOnTrackMs - 150L) }
                                     if (targetClip != null) {
                                         working = TimelineEngine.splitClipAt(working, targetClip.id, clip.startTimeOnTrackMs + cutOffset)
                                     }
@@ -865,19 +1251,19 @@ class EditorViewModel @Inject constructor(
                     AiToolType.VIDEO_HIGHLIGHTS -> {
                         if (clip == null) { notifyToast("Select a video clip first"); return@launch }
                         val (samples, _) = visionAiService.sampleClipFrames(
-                            clip.sourceUri, clip.trimStartMs, clip.trimEndMs, sampleCount = 14
+                            clip.sourceUri, clip.trimStartMs, clip.effectiveTrimEndMs, sampleCount = 14
                         )
-                        val audio = mediaAudioTools.analyzeAudioTrack(clip.sourceUri)
+                        val audio = if (clip.hasAudioTrack) mediaAudioTools.analyzeAudioTrack(clip.sourceUri) else null
                         val highlights = LocalAiAlgorithms.extractHighlightSegments(
                             samples = samples,
-                            audioPeaks = audio.beatAnalysis.peakEnvelope,
+                            audioPeaks = audio?.beatAnalysis?.peakEnvelope.orEmpty(),
                             sourceDurationMs = clip.trimmedSourceDurationMs,
                             windowDurationMs = minOf(3_000L, clip.trimmedSourceDurationMs),
                             maxHighlights = 1
                         )
                         val best = highlights.firstOrNull()
                         if (best != null) {
-                            applyMutation("AI Highlight Trim") { proj ->
+                            applyMutation("AI Highlight Trim", newSelectedClipId = clip.id) { proj ->
                                 TimelineEngine.trimClip(
                                     proj,
                                     clip.id,
@@ -895,7 +1281,7 @@ class EditorViewModel @Inject constructor(
                         if (clip == null) { notifyToast("Select a video clip first"); return@launch }
                         val needFaces = tool != AiToolType.MOTION_TRACKING
                         val (samples, dims) = visionAiService.sampleClipFrames(
-                            clip.sourceUri, clip.trimStartMs, clip.trimEndMs, sampleCount = 10, detectFaces = needFaces
+                            clip.sourceUri, clip.trimStartMs, clip.effectiveTrimEndMs, sampleCount = 10, detectFaces = needFaces
                         )
                         val srcAspect = dims.first.toFloat() / dims.second.coerceAtLeast(1).toFloat()
                         val dstAspect = session.currentProject.aspectRatio.ratioFloat
@@ -905,7 +1291,7 @@ class EditorViewModel @Inject constructor(
                             sourceAspect = srcAspect,
                             targetAspect = dstAspect
                         )
-                        applyMutation(tool.title) { proj ->
+                        applyMutation(tool.title, newSelectedClipId = clip.id) { proj ->
                             TimelineEngine.updateClip(proj, clip.id) { c ->
                                 val kept = c.keyframes.filterNot {
                                     it.property in setOf(KeyframeProperty.POSITION_X, KeyframeProperty.POSITION_Y, KeyframeProperty.SCALE)
@@ -929,7 +1315,7 @@ class EditorViewModel @Inject constructor(
                             intensity = 0.88f,
                             secondaryParam = focusRadius
                         )
-                        applyMutation("AI Subject Background Isolation") { proj ->
+                        applyMutation("AI Subject Background Isolation", newSelectedClipId = clip.id) { proj ->
                             TimelineEngine.addOrUpdateEffect(proj, clip.id, bgFx)
                         }
                         val pct = ((seg?.subjectRatio ?: 0.35f) * 100).toInt()
@@ -950,8 +1336,8 @@ class EditorViewModel @Inject constructor(
 
                     AiToolType.VIDEO_UPSCALING -> {
                         if (clip == null) { notifyToast("Select a video clip first"); return@launch }
-                        val sharp = AppliedEffect(type = EffectType.SHARPEN, intensity = 0.62f, secondaryParam = 0.45f)
-                        applyMutation("AI 4K Detail Upscale") { proj ->
+                        val sharp = AppliedEffect(type = EffectType.SHARPEN, intensity = 0.62f, secondaryParam = 0.45f, tertiaryParam = 0.25f)
+                        applyMutation("AI 4K Detail Upscale", newSelectedClipId = clip.id) { proj ->
                             val p1 = TimelineEngine.addOrUpdateEffect(proj, clip.id, sharp)
                             TimelineEngine.updateClip(p1, clip.id) { it.copy(upscaleTargetHeight = 2160) }
                         }
@@ -969,7 +1355,7 @@ class EditorViewModel @Inject constructor(
                         val textToUse = scriptInput.ifBlank {
                             "Hook: Every frame tells a story\nBuild momentum with sharp cuts\nColor grade for maximum emotion\nExport in crisp 4K 60fps"
                         }
-                        val existingClips = session.currentProject.tracks.first { it.type == TrackType.VIDEO_MAIN }.clips
+                        val existingClips = session.currentProject.mainVideoClips
                         val fallbackMedia = if (existingClips.isEmpty()) {
                             demoClipGenerator.generateSampleVideoClips()
                         } else emptyList()
@@ -981,7 +1367,7 @@ class EditorViewModel @Inject constructor(
 
                     AiToolType.VIDEO_SUMMARIZATION -> {
                         val samples = if (clip != null) {
-                            visionAiService.sampleClipFrames(clip.sourceUri, clip.trimStartMs, clip.trimEndMs, 10, true).first
+                            visionAiService.sampleClipFrames(clip.sourceUri, clip.trimStartMs, clip.effectiveTrimEndMs, 10, true).first
                         } else emptyList()
                         val report = LocalAiAlgorithms.summarizeProject(session.currentProject, samples)
                         _uiState.update { it.copy(latestSummaryReport = report) }
@@ -993,14 +1379,13 @@ class EditorViewModel @Inject constructor(
                             clipUri = clip.sourceUri,
                             normalizedMaskRect = CropRect(0.35f, 0.35f, 0.65f, 0.65f),
                             startMs = clip.trimStartMs,
-                            endMs = clip.trimEndMs
+                            endMs = clip.effectiveTrimEndMs
                         )
                         when (outcome) {
                             is ExternalAiResult.Success -> notifyToast(outcome.message)
                             is ExternalAiResult.NotConfigured -> {
-                                // Apply local GPU Soft Blur Mask as honest on-device privacy/object cover
                                 val blurFx = AppliedEffect(type = EffectType.GAUSSIAN_BLUR, intensity = 0.45f, secondaryParam = 0.5f)
-                                applyMutation("Local Object Blur Mask") {
+                                applyMutation("Local Object Blur Mask", newSelectedClipId = clip.id) {
                                     TimelineEngine.addOrUpdateEffect(it, clip.id, blurFx)
                                 }
                                 notifyToast("No Cloud Inpaint API set in Settings; applied local GPU Blur")
@@ -1015,7 +1400,7 @@ class EditorViewModel @Inject constructor(
         }
     }
 
-    // --- Save as Template & Professional Export ---
+    // --- Save as Template & Professional Export (Video MP4, Photo Frame JPG, Audio M4A) ---
     fun saveCurrentProjectAsTemplate(name: String, category: TemplateCategory) {
         viewModelScope.launch {
             val tpl = TemplateCatalog.extractTemplateFromProject(session.currentProject, name, category)
@@ -1031,17 +1416,36 @@ class EditorViewModel @Inject constructor(
     fun startExport() {
         previewController.pause()
         val cfg = session.currentProject.exportConfig
+        val currentPlayhead = playheadMs.value
         viewModelScope.launch {
             projectRepository.saveProject(session.currentProject, "Pre-export save")
             session.markSaved()
-            if (cfg.runInBackground) {
-                val req = OneTimeWorkRequestBuilder<ExportWorker>()
-                    .setInputData(workDataOf(ExportWorker.KEY_PROJECT_ID to session.currentProject.id))
-                    .build()
-                WorkManager.getInstance(context).enqueue(req)
-                notifyToast("Queued background export via WorkManager")
+            // Run single deterministic export pass (avoiding dual WorkManager + Foreground encoder collision!)
+            exportEngine.exportProject(session.currentProject, cfg, currentPlayhead)
+        }
+    }
+
+    fun quickCaptureGradedPhotoFrame() {
+        previewController.pause()
+        val photoCfg = session.currentProject.exportConfig.copy(
+            exportAsPhotoFrame = true,
+            audioOnly = false,
+            saveToGallery = true
+        )
+        val currentPlayhead = playheadMs.value
+        viewModelScope.launch {
+            val outcome = exportEngine.exportProject(session.currentProject, photoCfg, currentPlayhead)
+            when (outcome) {
+                is ExportProgressState.Completed -> {
+                    notifyToast("Saved graded photo frame to Gallery!")
+                    exportEngine.resetState()
+                }
+                is ExportProgressState.Error -> {
+                    notifyToast(outcome.message)
+                    exportEngine.resetState()
+                }
+                else -> {}
             }
-            exportEngine.exportProject(session.currentProject, cfg)
         }
     }
 
@@ -1049,8 +1453,11 @@ class EditorViewModel @Inject constructor(
 
     fun resetExportStatus() = exportEngine.resetState()
 
-    fun buildShareExportIntent(path: String, audioOnly: Boolean): Intent? =
-        exportEngine.buildShareIntent(path, audioOnly)
+    fun buildShareExportIntent(
+        path: String,
+        audioOnly: Boolean,
+        isPhotoFrame: Boolean = false
+    ): Intent? = exportEngine.buildShareIntent(path, audioOnly, isPhotoFrame)
 
     override fun onCleared() {
         super.onCleared()

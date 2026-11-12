@@ -2,6 +2,7 @@ package com.vibecut.pro.ui.editor.components
 
 import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -17,6 +18,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
@@ -33,9 +35,11 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
+import com.vibecut.pro.engine.color.ColorGradingEngine
 import com.vibecut.pro.engine.keyframes.KeyframeInterpolator
 import com.vibecut.pro.engine.model.*
 import com.vibecut.pro.ui.theme.*
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -47,20 +51,32 @@ fun PreviewViewport(
     playheadMs: Long,
     isPlaying: Boolean,
     selectedClip: TimelineClip?,
+    isCompareOriginal: Boolean,
     canUndo: Boolean,
     canRedo: Boolean,
     onTogglePlay: () -> Unit,
     onStepFrames: (Int) -> Unit,
+    onToggleCompare: () -> Unit,
     onQuickSplit: () -> Unit,
-    onQuickKeyframe: () -> Unit,
+    onQuickSnapshot: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
-    onImportMediaClick: () -> Unit,
+    onOpenMediaHub: () -> Unit,
     onGenerateDemoClick: () -> Unit,
     onDragSelectedOverlay: (Float, Float) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val mainHasClips = project.tracks.firstOrNull { it.type == TrackType.VIDEO_MAIN }?.clips?.isNotEmpty() == true
+    val mainHasClips = project.mainVideoClips.isNotEmpty()
+    val visibleVisualClip = remember(project, playheadMs, selectedClip?.id) {
+        project.findMainClipAt(playheadMs) ?: selectedClip
+    }
+
+    val activePips = remember(project.tracks, playheadMs) {
+        project.tracks
+            .filter { (it.type == TrackType.VIDEO_PIP || it.type == TrackType.OVERLAY) && !it.isHidden }
+            .flatMap { it.clips }
+            .filter { playheadMs in it.startTimeOnTrackMs..it.endTimeOnTrackMs }
+    }
     val activeTexts = remember(project.tracks, playheadMs) {
         project.tracks
             .filter { it.type == TrackType.TEXT && !it.isHidden }
@@ -74,6 +90,15 @@ fun PreviewViewport(
             .filter { playheadMs in it.startTimeOnTrackMs..it.endTimeOnTrackMs }
     }
 
+    val canDragSelectedOnCanvas = remember(selectedClip, project) {
+        val clip = selectedClip ?: return@remember false
+        val track = project.findTrackForClip(clip.id) ?: return@remember false
+        track.type != TrackType.VIDEO_MAIN ||
+            abs(clip.transform.scaleX) > 1.03f ||
+            abs(clip.transform.positionX) > 0.01f ||
+            abs(clip.transform.positionY) > 0.01f
+    }
+
     Column(modifier = modifier.fillMaxWidth()) {
         // Video Stage
         Box(
@@ -81,7 +106,7 @@ fun PreviewViewport(
                 .fillMaxWidth()
                 .weight(1f)
                 .background(Color(0xFF06080C))
-                .padding(horizontal = 12.dp, vertical = 6.dp),
+                .padding(horizontal = 10.dp, vertical = 4.dp),
             contentAlignment = Alignment.Center
         ) {
             BoxWithConstraints(
@@ -89,8 +114,13 @@ fun PreviewViewport(
                     .aspectRatio(project.aspectRatio.ratioFloat, matchHeightConstraintsFirst = true)
                     .clip(RoundedCornerShape(12.dp))
                     .background(Color(project.backgroundColorArgb))
-                    .border(1.dp, SurfaceStroke, RoundedCornerShape(12.dp))
-                    .pointerInput(selectedClip?.id) {
+                    .border(
+                        1.dp,
+                        if (isCompareOriginal) KeyframeGold.copy(alpha = 0.8f) else SurfaceStroke,
+                        RoundedCornerShape(12.dp)
+                    )
+                    .pointerInput(selectedClip?.id, canDragSelectedOnCanvas) {
+                        if (!canDragSelectedOnCanvas) return@pointerInput
                         detectDragGestures { change, dragAmount ->
                             change.consume()
                             if (size.width > 0 && size.height > 0) {
@@ -126,19 +156,58 @@ fun PreviewViewport(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.Center
                     ) {
-                        Icon(Icons.Default.VideoCall, contentDescription = null, tint = ElectricCyan, modifier = Modifier.size(38.dp))
+                        Icon(
+                            Icons.Default.AddPhotoAlternate,
+                            contentDescription = null,
+                            tint = ElectricCyan,
+                            modifier = Modifier.size(36.dp)
+                        )
                         Spacer(Modifier.height(8.dp))
                         Button(
-                            onClick = onImportMediaClick,
-                            colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan, contentColor = Color.Black),
+                            onClick = onOpenMediaHub,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = ElectricCyan,
+                                contentColor = Color(0xFF001F24)
+                            ),
+                            shape = RoundedCornerShape(10.dp),
                             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
                         ) {
-                            Text("Import Videos / Photos", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            Text("Import Videos, Photos or Audio", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                         }
                         TextButton(onClick = onGenerateDemoClick) {
-                            Text("Or Generate 3 Sample Clips", color = KeyframeGold, fontSize = 11.sp)
+                            Text("Or Generate 3 Studio Sample Clips", color = KeyframeGold, fontSize = 11.sp)
                         }
                     }
+                }
+
+                // Live PIP / Overlay Visual Layers
+                activePips.forEach { pip ->
+                    val localMs = (playheadMs - pip.startTimeOnTrackMs).coerceAtLeast(0L)
+                    val state = KeyframeInterpolator.evaluateClipState(pip, localMs)
+                    val offsetX = stageW * (state.positionX * 0.45f)
+                    val offsetY = stageH * (-state.positionY * 0.45f)
+                    val isSelected = selectedClip?.id == pip.id
+
+                    AsyncImage(
+                        model = pip.thumbnailUri ?: pip.sourceUri,
+                        contentDescription = pip.sourceName,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .width(stageW * 0.52f)
+                            .offset(x = offsetX, y = offsetY)
+                            .graphicsLayer(
+                                scaleX = state.scaleX,
+                                scaleY = state.scaleY,
+                                rotationZ = state.rotationDegrees,
+                                alpha = state.opacity.coerceIn(0f, 1f)
+                            )
+                            .clip(RoundedCornerShape(8.dp))
+                            .then(
+                                if (isSelected) Modifier.border(1.5.dp, ElectricCyan, RoundedCornerShape(8.dp))
+                                else Modifier
+                            )
+                    )
                 }
 
                 // Live Interactive Text Layers Overlay
@@ -154,19 +223,20 @@ fun PreviewViewport(
                         modifier = Modifier
                             .align(Alignment.Center)
                             .offset(x = offsetX, y = offsetY)
+                            .graphicsLayer(
+                                rotationZ = state.rotationDegrees,
+                                alpha = state.opacity.coerceIn(0f, 1f)
+                            )
                             .then(
                                 if (isSelected) Modifier.border(1.dp, ElectricCyan, RoundedCornerShape(6.dp))
                                 else Modifier
                             )
-                            .background(
-                                Color(spec.backgroundColorArgb),
-                                RoundedCornerShape(8.dp)
-                            )
+                            .background(Color(spec.backgroundColorArgb), RoundedCornerShape(8.dp))
                             .padding(horizontal = 8.dp, vertical = 4.dp)
                     ) {
                         Text(
                             text = spec.text,
-                            fontSize = (spec.fontSizeSp * 0.72f * kotlin.math.abs(state.scaleX)).sp,
+                            fontSize = (spec.fontSizeSp * 0.72f * abs(state.scaleX)).sp,
                             fontWeight = FontWeight.ExtraBold,
                             fontFamily = when {
                                 spec.fontFamilyName.contains("Mono", true) -> FontFamily.Monospace
@@ -208,11 +278,88 @@ fun PreviewViewport(
 
                     Text(
                         text = sticker.content,
-                        fontSize = (36f * kotlin.math.abs(state.scaleX)).sp,
+                        fontSize = (36f * abs(state.scaleX)).sp,
                         modifier = Modifier
                             .align(Alignment.Center)
                             .offset(x = offsetX, y = offsetY)
+                            .graphicsLayer(
+                                rotationZ = state.rotationDegrees,
+                                alpha = state.opacity.coerceIn(0f, 1f)
+                            )
                     )
+                }
+
+                // Live Status Overlay Badge (Compare Original or Active Filter/Detail/FX summary)
+                if (mainHasClips && visibleVisualClip != null) {
+                    val g = visibleVisualClip.colorGrade
+                    val presetName = ColorGradingEngine.findPresetById(g.lutPresetId, project.customColorPresets)?.name
+                    val summaryParts = buildList {
+                        if (presetName != null) add(presetName)
+                        if (g.sharpness > 0.01f || abs(g.clarity) > 0.01f || g.structure > 0.01f) add("Sharpen")
+                        val adjCount = g.activeManualAdjustmentCount -
+                            (if (g.sharpness > 0.01f) 1 else 0) -
+                            (if (abs(g.clarity) > 0.01f) 1 else 0) -
+                            (if (g.structure > 0.01f) 1 else 0)
+                        if (adjCount > 0) add("+$adjCount Adjust")
+                        val enabledFx = visibleVisualClip.effects.count { it.enabled }
+                        if (enabledFx > 0) add("$enabledFx FX")
+                    }
+
+                    if (isCompareOriginal) {
+                        Surface(
+                            color = KeyframeGold.copy(alpha = 0.92f),
+                            shape = RoundedCornerShape(50),
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .padding(top = 8.dp)
+                        ) {
+                            Text(
+                                text = "ORIGINAL (BEFORE)",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = Color.Black,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp)
+                            )
+                        }
+                    } else if (summaryParts.isNotEmpty()) {
+                        Surface(
+                            color = Color(0xAA0B0D14),
+                            shape = RoundedCornerShape(50),
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .padding(6.dp)
+                        ) {
+                            Text(
+                                text = summaryParts.joinToString(" • "),
+                                fontSize = 9.sp,
+                                color = ElectricCyan,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Floating +Media Quick Pill on Top-Right of Stage
+            if (mainHasClips) {
+                Surface(
+                    color = SurfaceElevated.copy(alpha = 0.92f),
+                    shape = RoundedCornerShape(50),
+                    border = BorderStroke(1.dp, SurfaceStroke),
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 4.dp, end = 4.dp)
+                        .clickable(onClick = onOpenMediaHub)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = null, tint = ElectricCyan, modifier = Modifier.size(14.dp))
+                        Text("Media", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
+                    }
                 }
             }
         }
@@ -222,53 +369,189 @@ fun PreviewViewport(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(PanelDark)
-                .padding(horizontal = 10.dp, vertical = 4.dp),
+                .padding(horizontal = 8.dp, vertical = 3.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Text(
                 text = "${formatTimecode(playheadMs, project.exportConfig.frameRate.fps)} / ${formatTimecode(project.totalDurationMs, project.exportConfig.frameRate.fps)}",
                 style = MaterialTheme.typography.labelSmall,
+                fontSize = 10.sp,
                 color = ElectricCyan
             )
 
             Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = { onStepFrames(-1) }, modifier = Modifier.size(32.dp)) {
-                    Icon(Icons.Default.SkipPrevious, contentDescription = "Previous Frame", modifier = Modifier.size(19.dp))
+                IconButton(onClick = { onStepFrames(-1) }, modifier = Modifier.size(30.dp)) {
+                    Icon(Icons.Default.SkipPrevious, contentDescription = "Prev Frame", modifier = Modifier.size(18.dp))
                 }
                 FilledIconButton(
                     onClick = onTogglePlay,
-                    modifier = Modifier.size(36.dp),
+                    modifier = Modifier.size(34.dp),
                     colors = IconButtonDefaults.filledIconButtonColors(
                         containerColor = ElectricCyan,
-                        contentColor = Color.Black
+                        contentColor = Color(0xFF001F24)
                     )
                 ) {
                     Icon(
                         imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                         contentDescription = "Play/Pause",
-                        modifier = Modifier.size(20.dp)
+                        modifier = Modifier.size(19.dp)
                     )
                 }
-                IconButton(onClick = { onStepFrames(1) }, modifier = Modifier.size(32.dp)) {
-                    Icon(Icons.Default.SkipNext, contentDescription = "Next Frame", modifier = Modifier.size(19.dp))
+                IconButton(onClick = { onStepFrames(1) }, modifier = Modifier.size(30.dp)) {
+                    Icon(Icons.Default.SkipNext, contentDescription = "Next Frame", modifier = Modifier.size(18.dp))
                 }
             }
 
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = onQuickSplit, modifier = Modifier.size(32.dp)) {
-                    Icon(Icons.Default.ContentCut, contentDescription = "Split", tint = TextPrimary, modifier = Modifier.size(17.dp))
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                // Before / After Compare Toggle
+                IconButton(onClick = onToggleCompare, modifier = Modifier.size(30.dp)) {
+                    Icon(
+                        Icons.Default.Compare,
+                        contentDescription = "Compare Before/After",
+                        tint = if (isCompareOriginal) KeyframeGold else TextSecondary,
+                        modifier = Modifier.size(17.dp)
+                    )
                 }
-                IconButton(onClick = onQuickKeyframe, modifier = Modifier.size(32.dp)) {
-                    Icon(Icons.Default.Diamond, contentDescription = "Add Keyframe", tint = KeyframeGold, modifier = Modifier.size(17.dp))
+                IconButton(onClick = onQuickSnapshot, modifier = Modifier.size(30.dp)) {
+                    Icon(Icons.Default.PhotoCamera, contentDescription = "Capture Frame", tint = TextSecondary, modifier = Modifier.size(16.dp))
                 }
-                IconButton(onClick = onUndo, enabled = canUndo, modifier = Modifier.size(32.dp)) {
-                    Icon(Icons.Default.Undo, contentDescription = "Undo", modifier = Modifier.size(18.dp))
+                IconButton(onClick = onQuickSplit, modifier = Modifier.size(30.dp)) {
+                    Icon(Icons.Default.ContentCut, contentDescription = "Split", tint = TextPrimary, modifier = Modifier.size(16.dp))
                 }
-                IconButton(onClick = onRedo, enabled = canRedo, modifier = Modifier.size(32.dp)) {
-                    Icon(Icons.Default.Redo, contentDescription = "Redo", modifier = Modifier.size(18.dp))
+                IconButton(onClick = onUndo, enabled = canUndo, modifier = Modifier.size(30.dp)) {
+                    Icon(Icons.Default.Undo, contentDescription = "Undo", modifier = Modifier.size(17.dp))
+                }
+                IconButton(onClick = onRedo, enabled = canRedo, modifier = Modifier.size(30.dp)) {
+                    Icon(Icons.Default.Redo, contentDescription = "Redo", modifier = Modifier.size(17.dp))
                 }
             }
+        }
+    }
+}
+
+/**
+ * Compact 52dp Scrubber & Clip Selector Strip shown when full Customization Studio panels
+ * (`Filters`, `Sharpen`, `Adjust`, `Effects`, `Text`, `AI`) are active so sliders & presets
+ * have spacious room without losing timeline scrubbing or clip switching!
+ */
+@Composable
+fun CompactTimelineStrip(
+    project: Project,
+    playheadMs: Long,
+    selectedClipId: String?,
+    onSelectClip: (String) -> Unit,
+    onSeekMs: (Long) -> Unit,
+    onExpandTimeline: () -> Unit,
+    onOpenMediaHub: () -> Unit
+) {
+    val totalMs = project.totalDurationMs.coerceAtLeast(1L)
+    val mainClips = project.mainVideoClips
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xFF0E111A))
+            .padding(horizontal = 10.dp, vertical = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            // Horizontal clip selector pills
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                mainClips.forEachIndexed { idx, clip ->
+                    val selected = clip.id == selectedClipId
+                    val hasEdits = !clip.colorGrade.isIdentity || clip.effects.isNotEmpty()
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (selected) ElectricCyan.copy(alpha = 0.20f) else SurfaceElevated)
+                            .border(
+                                1.dp,
+                                if (selected) ElectricCyan else SurfaceStroke,
+                                RoundedCornerShape(8.dp)
+                            )
+                            .clickable { onSelectClip(clip.id) }
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "${idx + 1}. ${clip.sourceName.take(14)}",
+                            fontSize = 10.sp,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                            color = if (selected) ElectricCyan else TextPrimary,
+                            maxLines = 1
+                        )
+                        if (hasEdits) {
+                            Box(
+                                modifier = Modifier
+                                    .size(5.dp)
+                                    .clip(CircleShape)
+                                    .background(KeyframeGold)
+                            )
+                        }
+                    }
+                }
+                Surface(
+                    color = SurfaceElevated,
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(1.dp, SurfaceStroke),
+                    modifier = Modifier.clickable(onClick = onOpenMediaHub)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = null, tint = ElectricCyan, modifier = Modifier.size(13.dp))
+                        Text("Add", fontSize = 10.sp, color = ElectricCyan, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            // Expand Full Multi-Track Timeline Toggle
+            Surface(
+                color = SurfaceElevated,
+                shape = RoundedCornerShape(8.dp),
+                border = BorderStroke(1.dp, SurfaceStroke),
+                modifier = Modifier.clickable(onClick = onExpandTimeline)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(3.dp)
+                ) {
+                    Icon(Icons.Default.ViewStream, contentDescription = null, tint = TextSecondary, modifier = Modifier.size(13.dp))
+                    Text("Tracks", fontSize = 10.sp, color = TextSecondary, fontWeight = FontWeight.SemiBold)
+                    Icon(Icons.Default.ExpandMore, contentDescription = null, tint = TextSecondary, modifier = Modifier.size(13.dp))
+                }
+            }
+        }
+
+        // Smooth Interactive Scrubber Bar
+        if (mainClips.isNotEmpty()) {
+            Slider(
+                value = playheadMs.toFloat().coerceIn(0f, totalMs.toFloat()),
+                onValueChange = { onSeekMs(it.toLong()) },
+                valueRange = 0f..totalMs.toFloat(),
+                colors = SliderDefaults.colors(
+                    thumbColor = ElectricCyan,
+                    activeTrackColor = ElectricCyan,
+                    inactiveTrackColor = SurfaceStroke
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(18.dp)
+            )
         }
     }
 }
@@ -286,6 +569,7 @@ fun MultiTrackTimeline(
     onToggleTrackMute: (String) -> Unit,
     onOpenTransitionInspector: (String) -> Unit,
     onImportClipToTrack: (TrackType) -> Unit,
+    onCollapseTimeline: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val zoom = project.timelineZoom.coerceIn(0.25f, 5.0f)
@@ -300,7 +584,7 @@ fun MultiTrackTimeline(
             .fillMaxWidth()
             .background(Color(0xFF0E111A))
     ) {
-        // Timeline Mini-Toolbar (Zoom, Magnetic, Snapping, +Media)
+        // Timeline Mini-Toolbar
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -327,9 +611,31 @@ fun MultiTrackTimeline(
                 IconButton(onClick = { onZoomChange((zoom / 1.25f).coerceAtLeast(0.25f)) }, modifier = Modifier.size(24.dp)) {
                     Icon(Icons.Default.ZoomOut, contentDescription = "Zoom Out", modifier = Modifier.size(15.dp))
                 }
-                Text("${(zoom * 100).roundToInt()}%", fontSize = 10.sp, color = TextSecondary, modifier = Modifier.align(Alignment.CenterVertically))
+                Text(
+                    "${(zoom * 100).roundToInt()}%",
+                    fontSize = 10.sp,
+                    color = TextSecondary,
+                    modifier = Modifier.align(Alignment.CenterVertically)
+                )
                 IconButton(onClick = { onZoomChange((zoom * 1.25f).coerceAtMost(5.0f)) }, modifier = Modifier.size(24.dp)) {
                     Icon(Icons.Default.ZoomIn, contentDescription = "Zoom In", modifier = Modifier.size(15.dp))
+                }
+                if (onCollapseTimeline != null) {
+                    Spacer(Modifier.width(4.dp))
+                    Surface(
+                        color = PanelDark,
+                        shape = RoundedCornerShape(6.dp),
+                        border = BorderStroke(1.dp, SurfaceStroke),
+                        modifier = Modifier.clickable(onClick = onCollapseTimeline)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Compact", fontSize = 9.sp, color = TextSecondary)
+                            Icon(Icons.Default.ExpandLess, contentDescription = null, tint = TextSecondary, modifier = Modifier.size(13.dp))
+                        }
+                    }
                 }
             }
         }
@@ -370,14 +676,12 @@ fun MultiTrackTimeline(
                             .verticalScroll(verticalScroll)
                             .width(timelineContentWidth)
                     ) {
-                        // Time Ruler (Tap anywhere to scrub!)
                         TimeRulerBar(
                             totalSeconds = totalTimelineSec.toInt(),
                             dpPerSec = dpPerSec,
                             onSeekMs = onSeekMs
                         )
 
-                        // Each Track Lane
                         project.tracks.forEach { track ->
                             TrackClipsLane(
                                 track = track,
@@ -390,7 +694,6 @@ fun MultiTrackTimeline(
                         }
                     }
 
-                    // Live Playhead Vertical Indicator overlaid at playheadMs position
                     val playheadXPx = with(density) { ((playheadMs / 1000f) * dpPerSec).dp.toPx() } - scrollState.value
                     if (playheadXPx >= 0f) {
                         val xDp = with(density) { playheadXPx.toDp() }
@@ -487,13 +790,19 @@ private fun TimeRulerBar(
             .height(22.dp)
             .background(Color(0xFF141824))
             .pointerInput(dpPerSec) {
+                detectTapGestures { offset ->
+                    val pxPerSec = with(density) { dpPerSec.dp.toPx() }
+                    val targetMs = ((offset.x / pxPerSec) * 1000f).toLong().coerceAtLeast(0L)
+                    onSeekMs(targetMs)
+                }
+            }
+            .pointerInput(dpPerSec) {
                 detectDragGestures { change, _ ->
                     val pxPerSec = with(density) { dpPerSec.dp.toPx() }
                     val targetMs = ((change.position.x / pxPerSec) * 1000f).toLong().coerceAtLeast(0L)
                     onSeekMs(targetMs)
                 }
             }
-            .clickable { }
     ) {
         val pxPerSec = dpPerSec.dp.toPx()
         for (s in 0..totalSeconds) {
@@ -569,36 +878,35 @@ private fun TrackClipsLane(
                     )
                     .clickable { onSelectClip(clip.id) }
             ) {
-                // Video thumbnail strip
+                val thumbModel = clip.thumbnailUri ?: clip.sourceUri
                 if (clip.mediaKind == MediaKind.VIDEO || clip.mediaKind == MediaKind.IMAGE) {
                     AsyncImage(
-                        model = clip.sourceUri,
+                        model = thumbModel,
                         contentDescription = null,
                         contentScale = ContentScale.Crop,
-                        alpha = 0.42f,
+                        alpha = 0.48f,
                         modifier = Modifier.fillMaxSize()
                     )
                 }
 
-                // Real Audio Waveform Canvas
-                if (clip.waveformPeaks.isNotEmpty() && track.type.isAudio) {
+                if (clip.waveformPeaks.isNotEmpty() && (track.type.isAudio || track.type == TrackType.VIDEO_MAIN)) {
                     Canvas(modifier = Modifier.fillMaxSize().padding(vertical = 4.dp)) {
                         val stepX = size.width / clip.waveformPeaks.size.coerceAtLeast(1)
-                        val midY = size.height / 2f
+                        val midY = size.height * (if (track.type.isAudio) 0.5f else 0.78f)
+                        val ampScale = if (track.type.isAudio) 0.45f else 0.18f
                         clip.waveformPeaks.forEachIndexed { wIdx, amp ->
                             val x = wIdx * stepX
-                            val barH = (amp * midY * 0.9f).coerceAtLeast(2f)
+                            val barH = (amp * size.height * ampScale).coerceAtLeast(1.5f)
                             drawLine(
-                                color = EmeraldBeat.copy(alpha = 0.65f),
+                                color = EmeraldBeat.copy(alpha = if (track.type.isAudio) 0.65f else 0.35f),
                                 start = Offset(x, midY - barH),
                                 end = Offset(x, midY + barH),
-                                strokeWidth = max(1.5f, stepX * 0.6f)
+                                strokeWidth = max(1.5f, stepX * 0.55f)
                             )
                         }
                     }
                 }
 
-                // Clip Title + Active Badges (FX / LUT / Speed / Freeze)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -615,17 +923,26 @@ private fun TrackClipsLane(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f)
                     )
-                    if (clip.effects.isNotEmpty()) {
-                        Text(
-                            text = "FX:${clip.effects.size}",
-                            fontSize = 8.sp,
-                            color = ElectricCyan,
-                            fontWeight = FontWeight.Bold
-                        )
+                    Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                        if (!clip.colorGrade.isIdentity) {
+                            Text(
+                                text = "LUT",
+                                fontSize = 8.sp,
+                                color = KeyframeGold,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        if (clip.effects.isNotEmpty()) {
+                            Text(
+                                text = "FX:${clip.effects.size}",
+                                fontSize = 8.sp,
+                                color = ElectricCyan,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
                 }
 
-                // Keyframe Diamonds & Beat Dots along bottom of clip
                 Canvas(modifier = Modifier.fillMaxSize()) {
                     val durMs = clip.timelineDurationMs.coerceAtLeast(1L).toFloat()
                     for (kf in clip.keyframes) {
@@ -650,7 +967,6 @@ private fun TrackClipsLane(
                 }
             }
 
-            // Transition Junction Node `[⇄]` between adjacent Main Video clips
             if (track.type == TrackType.VIDEO_MAIN && idx > 0) {
                 Box(
                     modifier = Modifier

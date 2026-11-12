@@ -340,22 +340,65 @@ fun AudioStudioPanel(
         if (selectedClip != null) {
             Card(colors = CardDefaults.cardColors(containerColor = PanelDark)) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Clip Audio Mix & Real-Time PCM DSP (${selectedClip.sourceName})", fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                    LabeledSlider("Volume (0–200%)", selectedClip.volume, 0f..2f) {
-                        viewModel.updateSelectedAudioDsp(volume = it)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Clip Audio Mix & DSP (${selectedClip.sourceName})",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 12.sp
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Mute", fontSize = 11.sp, color = TextSecondary)
+                            Spacer(Modifier.width(6.dp))
+                            Switch(
+                                checked = selectedClip.isMuted,
+                                onCheckedChange = { viewModel.updateSelectedAudioDsp(isMuted = it) }
+                            )
+                        }
                     }
-                    LabeledSlider("Fade In (sec)", selectedClip.fadeInMs / 1000f, 0f..3f) {
-                        viewModel.updateSelectedAudioDsp(fadeInMs = (it * 1000f).toLong())
-                    }
-                    LabeledSlider("Fade Out (sec)", selectedClip.fadeOutMs / 1000f, 0f..3f) {
-                        viewModel.updateSelectedAudioDsp(fadeOutMs = (it * 1000f).toLong())
-                    }
-                    LabeledSlider("Noise Reduction (90Hz HP + Gate)", selectedClip.noiseReduction, 0f..1f) {
-                        viewModel.updateSelectedAudioDsp(noiseReduction = it)
-                    }
-                    LabeledSlider("Voice Enhancement (2.8kHz Clarity)", selectedClip.voiceEnhancement, 0f..1f) {
-                        viewModel.updateSelectedAudioDsp(voiceEnhancement = it)
-                    }
+                    ProParameterSlider(
+                        label = "Volume",
+                        value = selectedClip.volume,
+                        defaultValue = 1.0f,
+                        range = 0f..2f,
+                        valueFormatter = { "${(it * 100).toInt()}%" },
+                        onValueChange = { viewModel.updateSelectedAudioDsp(volume = it) }
+                    )
+                    ProParameterSlider(
+                        label = "Fade In",
+                        value = selectedClip.fadeInMs / 1000f,
+                        defaultValue = 0f,
+                        range = 0f..3f,
+                        valueFormatter = { String.format(java.util.Locale.US, "%.1fs", it) },
+                        onValueChange = { viewModel.updateSelectedAudioDsp(fadeInMs = (it * 1000f).toLong()) }
+                    )
+                    ProParameterSlider(
+                        label = "Fade Out",
+                        value = selectedClip.fadeOutMs / 1000f,
+                        defaultValue = 0f,
+                        range = 0f..3f,
+                        valueFormatter = { String.format(java.util.Locale.US, "%.1fs", it) },
+                        onValueChange = { viewModel.updateSelectedAudioDsp(fadeOutMs = (it * 1000f).toLong()) }
+                    )
+                    ProParameterSlider(
+                        label = "Noise Reduction (90Hz HP + Gate)",
+                        value = selectedClip.noiseReduction,
+                        defaultValue = 0f,
+                        range = 0f..1f,
+                        valueFormatter = { "${(it * 100).toInt()}%" },
+                        onValueChange = { viewModel.updateSelectedAudioDsp(noiseReduction = it) }
+                    )
+                    ProParameterSlider(
+                        label = "Voice Clarity (2.8kHz Exciter)",
+                        value = selectedClip.voiceEnhancement,
+                        defaultValue = 0f,
+                        range = 0f..1f,
+                        valueFormatter = { "${(it * 100).toInt()}%" },
+                        onValueChange = { viewModel.updateSelectedAudioDsp(voiceEnhancement = it) }
+                    )
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,

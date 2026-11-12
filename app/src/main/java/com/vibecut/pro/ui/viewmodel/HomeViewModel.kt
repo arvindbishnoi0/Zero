@@ -1,10 +1,7 @@
 package com.vibecut.pro.ui.viewmodel
 
 import android.content.Context
-import android.media.MediaMetadataRetriever
 import android.net.Uri
-import android.provider.MediaStore
-import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vibecut.pro.data.local.ProjectRevisionEntity
@@ -20,20 +17,24 @@ import com.vibecut.pro.engine.templates.TemplateCatalog
 import com.vibecut.pro.engine.timeline.ImportedMediaSource
 import com.vibecut.pro.engine.timeline.TimelineEngine
 import com.vibecut.pro.media.export.VibeCutExportEngine
+import com.vibecut.pro.media.loader.MediaImportProgress
+import com.vibecut.pro.media.loader.MediaSupportManager
 import com.vibecut.pro.media.sample.DemoClipGenerator
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
 data class DeviceGalleryItem(
     val uri: String,
     val displayName: String,
     val durationMs: Long,
-    val mediaKind: MediaKind
+    val mediaKind: MediaKind,
+    val width: Int = 0,
+    val height: Int = 0,
+    val sizeBytes: Long = 0L,
+    val mimeType: String? = null
 )
 
 @HiltViewModel
@@ -42,6 +43,7 @@ class HomeViewModel @Inject constructor(
     private val projectRepository: ProjectRepository,
     private val preferencesRepository: AppPreferencesRepository,
     private val demoClipGenerator: DemoClipGenerator,
+    private val mediaSupportManager: MediaSupportManager,
     private val exportEngine: VibeCutExportEngine
 ) : ViewModel() {
 
@@ -56,6 +58,8 @@ class HomeViewModel @Inject constructor(
 
     private val _galleryItems = MutableStateFlow<List<DeviceGalleryItem>>(emptyList())
     val galleryItems: StateFlow<List<DeviceGalleryItem>> = _galleryItems.asStateFlow()
+
+    val importProgress: StateFlow<MediaImportProgress> = mediaSupportManager.importProgress
 
     private val _cacheSizeBytes = MutableStateFlow(0L)
     val cacheSizeBytes: StateFlow<Long> = _cacheSizeBytes.asStateFlow()
@@ -101,12 +105,71 @@ class HomeViewModel @Inject constructor(
         onCreated: (String) -> Unit
     ) {
         viewModelScope.launch {
+            if (uris.isEmpty()) {
+                val p = projectRepository.createNewProject(title, aspectRatio)
+                onCreated(p.id)
+                return@launch
+            }
             _isBusy.value = true
             try {
+                val batch = mediaSupportManager.importMediaBatch(uris)
+                if (batch.imported.isEmpty()) {
+                    _statusBanner.value = batch.failures.firstOrNull() ?: "Could not load selected media"
+                    return@launch
+                }
                 var project = projectRepository.createNewProject(title, aspectRatio)
-                val sources = uris.map { inspectMediaUri(context, it) }
-                project = TimelineEngine.importMediaClips(project, sources, TrackType.VIDEO_MAIN)
-                projectRepository.saveProject(project, "Imported ${sources.size} media item(s)")
+                val visualSources = batch.imported.filter { it.mediaKind != MediaKind.AUDIO }
+                val audioSources = batch.imported.filter { it.mediaKind == MediaKind.AUDIO }
+
+                if (visualSources.isNotEmpty()) {
+                    project = TimelineEngine.importMediaClips(project, visualSources, TrackType.VIDEO_MAIN)
+                } else {
+                    // If user started a project from an audio track alone, generate a sleek studio backdrop clip
+                    val dims = aspectRatio.computeCodecSafeDimensions(720)
+                    val canvasClip = demoClipGenerator.generateStudioCanvasClip(
+                        title = "Audio Backdrop",
+                        width = dims.first,
+                        height = dims.second,
+                        durationMs = audioSources.sumOf { it.durationMs }.coerceIn(4_000L, 15_000L)
+                    )
+                    project = TimelineEngine.importMediaClips(project, listOf(canvasClip), TrackType.VIDEO_MAIN)
+                }
+                if (audioSources.isNotEmpty()) {
+                    project = TimelineEngine.importMediaClips(project, audioSources, TrackType.AUDIO_MUSIC)
+                }
+                projectRepository.saveProject(project, "Imported ${batch.imported.size} media item(s)")
+                if (batch.failures.isNotEmpty()) {
+                    _statusBanner.value = "Imported ${batch.imported.size}; skipped ${batch.failures.size}"
+                }
+                onCreated(project.id)
+            } finally {
+                _isBusy.value = false
+            }
+        }
+    }
+
+    fun createStudioCanvasProject(
+        title: String,
+        aspectRatio: AspectRatioPreset,
+        primaryArgb: Int = 0xFF141828.toInt(),
+        secondaryArgb: Int = 0xFF00B8D4.toInt(),
+        onCreated: (String) -> Unit
+    ) {
+        viewModelScope.launch {
+            _isBusy.value = true
+            try {
+                val dims = aspectRatio.computeCodecSafeDimensions(720)
+                val canvasClip = demoClipGenerator.generateStudioCanvasClip(
+                    title = title.ifBlank { "Studio Canvas" },
+                    primaryColorArgb = primaryArgb,
+                    secondaryColorArgb = secondaryArgb,
+                    width = dims.first,
+                    height = dims.second,
+                    durationMs = 5_000L
+                )
+                var project = projectRepository.createNewProject(title.ifBlank { "Canvas Edit" }, aspectRatio)
+                project = TimelineEngine.importMediaClips(project, listOf(canvasClip), TrackType.VIDEO_MAIN)
+                projectRepository.saveProject(project, "Created Studio Canvas")
                 onCreated(project.id)
             } finally {
                 _isBusy.value = false
@@ -144,11 +207,15 @@ class HomeViewModel @Inject constructor(
             _isBusy.value = true
             try {
                 val sources = if (selectedUris.isNotEmpty()) {
-                    selectedUris.map { inspectMediaUri(context, it) }
+                    mediaSupportManager.importMediaBatch(selectedUris).imported
+                        .filter { it.mediaKind != MediaKind.AUDIO }
+                        .ifEmpty { demoClipGenerator.generateSampleVideoClips() }
                 } else {
                     demoClipGenerator.generateSampleVideoClips()
                 }
-                val musicSource = musicUri?.let { inspectMediaUri(context, it, forceAudio = true) }
+                val musicSource = musicUri?.let {
+                    mediaSupportManager.importSingleUri(it, forceAudio = true).getOrNull()
+                }
                 val project = TemplateCatalog.applyTemplate(
                     template = template,
                     sources = sources,
@@ -200,36 +267,20 @@ class HomeViewModel @Inject constructor(
     }
 
     fun loadDeviceGalleryMedia() {
-        viewModelScope.launch(Dispatchers.IO) {
-            val found = mutableListOf<DeviceGalleryItem>()
-            runCatching {
-                val projection = arrayOf(
-                    MediaStore.Video.Media._ID,
-                    MediaStore.Video.Media.DISPLAY_NAME,
-                    MediaStore.Video.Media.DURATION
+        viewModelScope.launch {
+            val entries = mediaSupportManager.scanDeviceMediaLibrary(maxPerCategory = 50)
+            _galleryItems.value = entries.map { e ->
+                DeviceGalleryItem(
+                    uri = e.uri,
+                    displayName = e.displayName,
+                    durationMs = e.durationMs,
+                    mediaKind = e.mediaKind,
+                    width = e.width,
+                    height = e.height,
+                    sizeBytes = e.sizeBytes,
+                    mimeType = e.mimeType
                 )
-                context.contentResolver.query(
-                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                    projection,
-                    null,
-                    null,
-                    "${MediaStore.Video.Media.DATE_ADDED} DESC"
-                )?.use { cursor ->
-                    val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
-                    val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
-                    val durCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
-                    var count = 0
-                    while (cursor.moveToNext() && count < 60) {
-                        val id = cursor.getLong(idCol)
-                        val name = cursor.getString(nameCol) ?: "Video_$id"
-                        val dur = cursor.getLong(durCol).coerceAtLeast(1_000L)
-                        val contentUri = Uri.withAppendedPath(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id.toString())
-                        found.add(DeviceGalleryItem(contentUri.toString(), name, dur, MediaKind.VIDEO))
-                        count++
-                    }
-                }
             }
-            _galleryItems.value = found
         }
     }
 
@@ -271,57 +322,16 @@ class HomeViewModel @Inject constructor(
             context: Context,
             uri: Uri,
             forceAudio: Boolean = false
-        ): ImportedMediaSource = withContext(Dispatchers.IO) {
-            var displayName = uri.lastPathSegment ?: "Media"
-            val mimeType = context.contentResolver.getType(uri).orEmpty()
-
-            runCatching {
-                context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-                    ?.use { c ->
-                        if (c.moveToFirst()) {
-                            displayName = c.getString(0) ?: displayName
-                        }
-                    }
+        ): ImportedMediaSource {
+            val mgr = MediaSupportManager(context)
+            return mgr.importSingleUri(uri, forceAudio = forceAudio).getOrElse {
+                ImportedMediaSource(
+                    uri = uri.toString(),
+                    displayName = uri.lastPathSegment ?: "Media",
+                    mediaKind = if (forceAudio) MediaKind.AUDIO else MediaKind.VIDEO,
+                    durationMs = 4_000L
+                )
             }
-
-            val kind = when {
-                forceAudio || mimeType.startsWith("audio/") -> MediaKind.AUDIO
-                mimeType.startsWith("image/") -> MediaKind.IMAGE
-                else -> MediaKind.VIDEO
-            }
-
-            var durationMs = if (kind == MediaKind.IMAGE) 3_500L else 5_000L
-            var width = 1080
-            var height = 1920
-
-            if (kind != MediaKind.IMAGE) {
-                val retriever = MediaMetadataRetriever()
-                try {
-                    if (uri.scheme == "file") {
-                        retriever.setDataSource(uri.path)
-                    } else {
-                        retriever.setDataSource(context, uri)
-                    }
-                    durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                        ?.toLongOrNull()?.coerceAtLeast(300L) ?: 5_000L
-                    width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
-                        ?.toIntOrNull() ?: 1080
-                    height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
-                        ?.toIntOrNull() ?: 1920
-                } catch (_: Exception) {
-                } finally {
-                    runCatching { retriever.release() }
-                }
-            }
-
-            ImportedMediaSource(
-                uri = uri.toString(),
-                displayName = displayName,
-                mediaKind = kind,
-                durationMs = durationMs,
-                width = width,
-                height = height
-            )
         }
     }
 }

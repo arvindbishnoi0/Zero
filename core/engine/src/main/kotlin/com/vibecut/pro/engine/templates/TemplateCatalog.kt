@@ -297,9 +297,11 @@ object TemplateCatalog {
         customSubtitle: String = template.defaultSubtitleText,
         musicSource: ImportedMediaSource? = null
     ): Project {
-        val colorConfig = ColorGradingEngine.builtInPresets
-            .firstOrNull { it.id == template.colorPresetId }?.config
-            ?: ColorGradeConfig()
+        val colorConfig = ColorGradeConfig(
+            lutPresetId = ColorGradingEngine.builtInPresets
+                .firstOrNull { it.id == template.colorPresetId }?.id,
+            lutIntensity = 0.90f
+        )
 
         var project = Project(
             title = template.name,
@@ -321,7 +323,7 @@ object TemplateCatalog {
                     sourceUri = src.uri,
                     sourceName = src.displayName,
                     mediaKind = src.mediaKind,
-                    sourceDurationMs = src.durationMs,
+                    sourceDurationMs = if (src.mediaKind == MediaKind.IMAGE) maxOf(30_000L, src.durationMs) else src.durationMs,
                     startTimeOnTrackMs = cursorMs,
                     trimStartMs = 0L,
                     trimEndMs = trimEnd,
@@ -330,7 +332,13 @@ object TemplateCatalog {
                     effects = fxList,
                     colorGrade = colorConfig,
                     transitionIn = slot.transitionIn?.let { ClipTransition(it, 420L) },
-                    waveformPeaks = src.waveformPeaks
+                    waveformPeaks = src.waveformPeaks,
+                    hasAudioTrack = src.hasAudioTrack && src.mediaKind != MediaKind.IMAGE,
+                    sourceWidth = src.width,
+                    sourceHeight = src.height,
+                    rotationDegreesMeta = src.rotationDegreesMeta,
+                    mimeType = src.mimeType,
+                    thumbnailUri = src.thumbnailUri
                 )
                 cursorMs += clip.timelineDurationMs
                 clip

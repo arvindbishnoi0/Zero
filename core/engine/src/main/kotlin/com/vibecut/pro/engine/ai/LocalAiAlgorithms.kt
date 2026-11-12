@@ -209,7 +209,12 @@ object LocalAiAlgorithms {
         val mainTrack = project.tracks.firstOrNull { it.type == TrackType.VIDEO_MAIN } ?: return project
         if (mainTrack.isLocked || mainTrack.clips.isEmpty()) return project
 
-        val cinematicGrade = ColorGradingEngine.builtInPresets.first().config.copy(sharpness = 0.30f)
+        val cinematicGrade = ColorGradeConfig(
+            lutPresetId = "preset-teal-orange",
+            lutIntensity = 0.85f,
+            sharpness = 0.30f,
+            clarity = 0.18f
+        )
         val transitions = listOf(
             TransitionType.ZOOM,
             TransitionType.DISSOLVE,
