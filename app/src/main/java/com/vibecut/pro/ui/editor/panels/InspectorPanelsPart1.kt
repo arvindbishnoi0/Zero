@@ -36,6 +36,25 @@ import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
+
+/** Linearly samples the editor curve between neighboring control points. */
+private fun sampleEditorCurve(points: List<CurvePoint>, x: Float): Float {
+    if (points.isEmpty()) return x.coerceIn(0f, 1f)
+    val sorted = points.sortedBy { it.x }
+    if (x <= sorted.first().x) return sorted.first().y
+    for (i in 0 until sorted.lastIndex) {
+        val left = sorted[i]
+        val right = sorted[i + 1]
+        if (x <= right.x) {
+            val span = right.x - left.x
+            if (span <= 0f) return right.y
+            val t = ((x - left.x) / span).coerceIn(0f, 1f)
+            return left.y + (right.y - left.y) * t
+        }
+    }
+    return sorted.last().y
+}
+
 // ============================================================================
 // 1. CLIP EDIT PANEL (Trim, Duration, Speed & Ramps, Crop, Transform)
 // ============================================================================
@@ -1117,7 +1136,7 @@ private fun InteractiveCurveBox(
         val steps = 48
         for (s in 0..steps) {
             val t = s / steps.toFloat()
-            val yVal = ColorGradingEngine.sampleCurve(safePoints, t)
+            val yVal = sampleEditorCurve(safePoints, t)
             val px = t * size.width
             val py = (1f - yVal) * size.height
             if (s == 0) path.moveTo(px, py) else path.lineTo(px, py)
