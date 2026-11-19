@@ -1143,7 +1143,7 @@ object ClipEffectsFactory {
             clip.transform.rotationDegrees % 360f != 0f ||
             clip.transform.flipHorizontal ||
             clip.transform.flipVertical ||
-            clip.transform.blendMode != BlendMode.NORMAL ||
+            !clip.transform.blendMode.isNormal ||
             clip.chromaKey.isActive ||
             project.enhancement.enabled ||
             clip.keyframes.any { it.property == KeyframeProperty.BLUR || it.property == KeyframeProperty.OPACITY }
