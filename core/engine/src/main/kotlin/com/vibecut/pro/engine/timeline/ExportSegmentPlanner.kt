@@ -1,7 +1,7 @@
 package com.vibecut.pro.engine.timeline
 
 import com.vibecut.pro.engine.model.*
-import kotlin.math.abs
+
 import kotlin.math.max
 import kotlin.math.roundToLong
 
@@ -94,39 +94,36 @@ object ExportSegmentPlanner {
             )
         }
 
-        // Ramped clip: quantise the timeline into fixed slices, each with constant average speed.
+        // Ramped clip: flatten the curve into constant-rate slices using the piecewise integral,
+        // so each slice decodes its real source window AND plays it at the rate the curve demands.
+        // (Previously every slice was stamped 1x, which exported ramps at normal speed.)
         val steps = RAMP_RESOLUTION_STEPS.coerceAtMost(MAX_RAMP_SEGMENTS)
-        val sliceMs = max(40L, totalTimelineMs / steps)
-        val out = ArrayList<SpeedSegmentPlan>(steps + 1)
+        val slices = clip.speedRampSegments(steps)
+        if (slices.isEmpty()) return emptyList()
 
-        var offset = 0L
-        var index = 0
-        while (offset < totalTimelineMs) {
-            val end = minOf(totalTimelineMs, offset + sliceMs)
-            val srcA = clip.mapTimelineOffsetToSourceMs(offset)
-            val srcB = clip.mapTimelineOffsetToSourceMs(end)
-            val srcSpan = abs(srcB - srcA).coerceAtLeast(1L)
-            // Export reads the source range natively; the segment already IS the right length, so a
-            // speed provider must not be attached (1x) or the audio would be pitched twice.
-            val effectiveSpeed = 1f
-
+        val out = ArrayList<SpeedSegmentPlan>(slices.size)
+        slices.forEachIndexed { index, slice ->
             out += SpeedSegmentPlan(
                 clipId = clip.id,
                 segmentIndex = index,
-                totalSegments = steps,
-                sourceStartMs = minOf(srcA, srcB),
-                sourceEndMs = max(srcA, srcB),
-                timelineStartMs = baseStart + offset,
-                timelineEndMs = baseStart + end,
-                speed = effectiveSpeed,
+                totalSegments = slices.size,
+                sourceStartMs = slice.sourceStartMs,
+                sourceEndMs = slice.sourceEndMs,
+                timelineStartMs = baseStart + slice.timelineStartMs,
+                timelineEndMs = baseStart + slice.timelineEndMs,
+                // Real rate for this slice: sourceSpan / timelineSpan. The exporter attaches a
+                // constant speed provider per slice, which together reproduce the whole curve.
+                speed = playbackRateFor(slice.sourceSpanMs, slice.timelineSpanMs),
                 isReversed = clip.isReversed,
                 isFrozen = false
             )
-            offset = end
-            index++
         }
-        // Re-stamp totalSegments now that the real count is known.
-        return out.map { it.copy(totalSegments = out.size) }
+        // Guarantee the slices tile [baseStart, baseStart + totalTimelineMs] exactly.
+        val lastIndex = out.lastIndex
+        if (lastIndex >= 0 && out[lastIndex].timelineEndMs != baseStart + totalTimelineMs) {
+            out[lastIndex] = out[lastIndex].copy(timelineEndMs = baseStart + totalTimelineMs)
+        }
+        return out
     }
 
     /**

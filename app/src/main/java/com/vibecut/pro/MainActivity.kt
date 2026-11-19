@@ -7,7 +7,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavType
@@ -26,8 +28,13 @@ import dagger.hilt.android.AndroidEntryPoint
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
 
+    private var preferencesReady = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
-        installSplashScreen()
+        // Hold the splash until DataStore has actually answered "has this user onboarded?".
+        // Without this the first composition always saw the default `false` and forced the
+        // onboarding screen on every cold start.
+        installSplashScreen().setKeepOnScreenCondition { !preferencesReady }
         super.onCreate(savedInstanceState)
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
@@ -35,19 +42,27 @@ class MainActivity : ComponentActivity() {
         )
         setContent {
             ZeroTheme {
-                VibeCutNavigationApp()
+                ZeroApp(onPreferencesResolved = { preferencesReady = true })
             }
         }
     }
 }
 
 @Composable
-fun VibeCutNavigationApp() {
+fun ZeroApp(onPreferencesResolved: () -> Unit = {}) {
     val navController = rememberNavController()
     val homeViewModel: HomeViewModel = hiltViewModel()
-    val prefs by homeViewModel.preferences.collectAsState()
+    val resolved by homeViewModel.resolvedPreferences.collectAsState()
 
-    val startRoute = if (prefs.onboardingCompleted) "home" else "onboarding"
+    // Nothing is composed until the stored preferences are known, so `startDestination` is
+    // computed exactly once with the real value and is never mutated afterwards (changing a
+    // NavHost start destination after the graph is built does not re-route anyway).
+    val prefs = resolved ?: return
+    LaunchedEffect(Unit) { onPreferencesResolved() }
+
+    val startRoute = remember(prefs.onboardingCompleted) {
+        if (prefs.onboardingCompleted) "home" else "onboarding"
+    }
 
     NavHost(
         navController = navController,

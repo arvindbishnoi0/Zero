@@ -231,7 +231,11 @@ class VibeCutExportEngine @Inject constructor(
                     targetExportHeight = targetShortSide,
                     useCodecSafeAlignment = true,
                     segmentSpeed = if (seg.isFrozen) 1f else seg.speed,
-                    applySpeedProvider = !clip.hasSpeedRamp && !seg.isFrozen,
+                    // Ramped clips are flattened into constant-rate slices by the planner, and
+                    // each slice carries its real rate — so the speed provider must be attached
+                    // for ramps too. Skipping it (the old behaviour) exported every speed ramp
+                    // at 1.0x while the preview played it ramped.
+                    applySpeedProvider = !seg.isFrozen && kotlin.math.abs(seg.speed - 1f) > 0.001f,
                     segmentTimelineOffsetMs = seg.timelineStartMs - clip.startTimeOnTrackMs
                 )
 
@@ -590,7 +594,12 @@ class VibeCutExportEngine @Inject constructor(
                 val sourceFrame = decodeHighResClipFrame(clip, localOffsetMs)
                     ?: throw IllegalStateException("Unable to decode frame from '${clip.sourceName}'.")
 
-                val (targetW, targetH) = project.aspectRatio.computeDimensions(config.resolution.shortSidePx)
+                // Honour a CUSTOM project ratio — `computeDimensions` falls back to 1:1 for CUSTOM,
+                // so photo exports from a custom-ratio project came out square.
+                val (targetW, targetH) = project.aspectRatio.computeDimensionsFor(
+                    config.resolution.shortSidePx,
+                    project.customAspectRatio
+                )
                 val outBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
                 val canvas = Canvas(outBitmap)
                 canvas.drawColor(Color.BLACK)
@@ -1089,8 +1098,39 @@ class VibeCutExportEngine @Inject constructor(
         return Intent(Intent.ACTION_SEND).apply {
             type = mime
             putExtra(Intent.EXTRA_STREAM, contentUri)
-            putExtra(Intent.EXTRA_TEXT, "Edited with VibeCut Pro ✨")
+            putExtra(Intent.EXTRA_TEXT, "Edited with Zero ✨")
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+    }
+
+    /**
+     * Intent for the "Open" button.
+     *
+     * This used to reuse [buildShareIntent], so tapping Open launched a *share* intent with no
+     * chooser — on most devices that simply did nothing. Playback needs ACTION_VIEW.
+     */
+    fun buildViewIntent(
+        outputFilePath: String,
+        audioOnly: Boolean,
+        isPhotoFrame: Boolean = false
+    ): Intent? {
+        val file = File(outputFilePath)
+        if (!file.exists()) return null
+        val contentUri = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            file
+        )
+        val mime = when {
+            isPhotoFrame || file.extension.equals("jpg", ignoreCase = true) || file.extension.equals("png", ignoreCase = true) ->
+                "image/jpeg"
+            audioOnly || file.extension.equals("m4a", ignoreCase = true) ->
+                "audio/mp4"
+            else -> "video/mp4"
+        }
+        return Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(contentUri, mime)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
         }
     }
 

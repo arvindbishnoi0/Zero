@@ -2,6 +2,7 @@ package com.vibecut.pro.media.shader
 
 import android.content.Context
 import android.graphics.*
+import com.vibecut.pro.engine.model.BlendMode as EngineBlendMode
 import android.net.Uri
 import android.opengl.GLES20
 import android.opengl.GLUtils
@@ -483,6 +484,14 @@ class VibeCutMasterFinishingGlEffect(
                 glProgram.setFloatUniformSafe("uChromaSoftness", chroma.softness.coerceIn(0f, 1f))
                 glProgram.setFloatUniformSafe("uChromaAmount", chroma.amount.coerceIn(0f, 1f))
                 glProgram.setFloatUniformSafe("uChromaSpill", chroma.spillSuppression.coerceIn(0f, 1f))
+                // The finishing shader runs on a single-input graph, so there is no backdrop
+                // texture to blend against here. Bind the uniforms explicitly: leaving
+                // `uHasBackdrop` unset left an undefined value, and an unbound sampler2D
+                // defaults to texture unit 0 — i.e. the frame blending with itself.
+                // Overlay/PIP blending is done on the composite canvas instead (see
+                // `VibeCutSceneOverlay`, which honours `BlendMode` via Paint xfermodes).
+                glProgram.setFloatUniformSafe("uHasBackdrop", 0f)
+                glProgram.setSamplerTexIdUniform("uBackdropSampler", inputTexId, 1)
                 glProgram.setIntUniformSafe("uBlendMode", activeClip.transform.blendMode.glCode)
                 glProgram.setIntUniformSafe("uTransitionType", GlslShaderGenerator.transitionCode(transition?.type))
                 glProgram.setFloatUniformSafe("uTransitionProgress", progress)
@@ -665,6 +674,8 @@ class VibeCutSceneOverlay(
     private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val pipPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val pipBitmapCache = LinkedHashMap<String, Bitmap?>()
+
+
     private var lastRenderedBucketMs = -1L
     private var lastWasEmpty = true
     /** True while [bitmap] holds a freshly drawn overlay that must not be reused for the same bucket. */
@@ -711,7 +722,9 @@ class VibeCutSceneOverlay(
             val aspect = bmp.height.toFloat() / max(1, bmp.width).toFloat()
             val drawH = drawW * aspect
             pipPaint.alpha = (kf.opacity * 255f).roundToInt().coerceIn(0, 255)
-            pipPaint.xfermode = null
+            // Honour the clip's blend mode. This was hardcoded to `null` (Normal), so every
+            // mode in the Transform panel composited identically.
+            applyBlendMode(pipPaint, pip.transform.blendMode)
             canvas.save()
             canvas.rotate(kf.rotationDegrees, cx, cy)
             canvas.drawBitmap(bmp, null, RectF(cx - drawW / 2f, cy - drawH / 2f, cx + drawW / 2f, cy + drawH / 2f), pipPaint)
@@ -761,6 +774,55 @@ class VibeCutSceneOverlay(
         }
 
         return bitmap
+    }
+
+    /**
+     * Maps the engine's [BlendMode] onto the platform compositor.
+     *
+     * API 29+ has a native `BlendMode` covering every separable and non-separable mode; older
+     * devices fall back to the Porter-Duff subset and composite normally for modes that cannot
+     * be expressed, rather than drawing something wrong.
+     */
+    private fun applyBlendMode(paint: Paint, mode: EngineBlendMode) {
+        if (mode.isNormal) {
+            paint.xfermode = null
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                paint.blendMode = android.graphics.BlendMode.SRC_OVER
+            }
+            return
+        }
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            paint.blendMode = when (mode) {
+                EngineBlendMode.SCREEN -> android.graphics.BlendMode.SCREEN
+                EngineBlendMode.MULTIPLY -> android.graphics.BlendMode.MULTIPLY
+                EngineBlendMode.OVERLAY -> android.graphics.BlendMode.OVERLAY
+                EngineBlendMode.ADD -> android.graphics.BlendMode.PLUS
+                EngineBlendMode.DARKEN -> android.graphics.BlendMode.DARKEN
+                EngineBlendMode.LIGHTEN -> android.graphics.BlendMode.LIGHTEN
+                EngineBlendMode.SOFT_LIGHT -> android.graphics.BlendMode.SOFT_LIGHT
+                EngineBlendMode.HARD_LIGHT -> android.graphics.BlendMode.HARD_LIGHT
+                EngineBlendMode.DIFFERENCE -> android.graphics.BlendMode.DIFFERENCE
+                EngineBlendMode.COLOR_DODGE -> android.graphics.BlendMode.COLOR_DODGE
+                EngineBlendMode.COLOR_BURN -> android.graphics.BlendMode.COLOR_BURN
+                EngineBlendMode.EXCLUSION -> android.graphics.BlendMode.EXCLUSION
+                EngineBlendMode.SUBTRACT -> android.graphics.BlendMode.DIFFERENCE
+                EngineBlendMode.HUE -> android.graphics.BlendMode.HUE
+                EngineBlendMode.COLOR -> android.graphics.BlendMode.COLOR
+                EngineBlendMode.LUMINOSITY -> android.graphics.BlendMode.LUMINOSITY
+                EngineBlendMode.NORMAL -> android.graphics.BlendMode.SRC_OVER
+            }
+            return
+        }
+        val legacy = when (mode) {
+            EngineBlendMode.SCREEN -> PorterDuff.Mode.SCREEN
+            EngineBlendMode.MULTIPLY -> PorterDuff.Mode.MULTIPLY
+            EngineBlendMode.OVERLAY -> PorterDuff.Mode.OVERLAY
+            EngineBlendMode.ADD -> PorterDuff.Mode.ADD
+            EngineBlendMode.DARKEN -> PorterDuff.Mode.DARKEN
+            EngineBlendMode.LIGHTEN -> PorterDuff.Mode.LIGHTEN
+            else -> null
+        }
+        paint.xfermode = legacy?.let { android.graphics.PorterDuffXfermode(it) }
     }
 
     private fun loadPipBitmap(pip: TimelineClip): Bitmap? {
@@ -1081,7 +1143,7 @@ object ClipEffectsFactory {
             clip.transform.rotationDegrees % 360f != 0f ||
             clip.transform.flipHorizontal ||
             clip.transform.flipVertical ||
-            clip.transform.blendMode != BlendMode.NORMAL ||
+            !clip.transform.blendMode.isNormal ||
             clip.chromaKey.isActive ||
             project.enhancement.enabled ||
             clip.keyframes.any { it.property == KeyframeProperty.BLUR || it.property == KeyframeProperty.OPACITY }

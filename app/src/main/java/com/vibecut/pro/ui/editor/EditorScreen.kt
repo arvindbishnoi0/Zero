@@ -45,8 +45,11 @@ import kotlinx.coroutines.delay
 /**
  * ZERO editor workspace.
  *
- * Layout: header → large aspect-correct preview → transport → timeline → tool dock. Every tool opens
- * its own bottom sheet (one sheet per job), so nothing is hidden behind scrolling inspector pages.
+ * Layout: header → large aspect-correct preview → transport → timeline/inspector → tool dock.
+ *
+ * Tools open in a **docked inspector** that replaces the timeline rather than a modal sheet, so the
+ * preview above stays visible and keeps playing while the user grades, trims or keyframes. Only
+ * Export and Project settings — one-shot tasks with nothing to watch — are still modal.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -98,16 +101,12 @@ fun EditorScreen(
         },
         bottomBar = {
             EditorDock(
-                hasSelection = state.selectedClip != null,
-                hasClips = project.mainVideoClips.isNotEmpty(),
-                onImport = { viewModel.setShowMediaImporterSheet(true) },
-                onClip = { viewModel.openSheet(EditorSheet.CLIP) },
-                onFilters = { viewModel.openSheet(EditorSheet.FILTERS) },
-                onAdjust = { viewModel.openSheet(EditorSheet.ADJUST) },
-                onEffects = { viewModel.openSheet(EditorSheet.EFFECTS) },
-                onText = { viewModel.openSheet(EditorSheet.TEXT) },
-                onAudio = { viewModel.openSheet(EditorSheet.AUDIO) },
-                onMore = { viewModel.openSheet(EditorSheet.TRANSFORM) }
+                activeSheet = state.openSheet,
+                // A clip under the playhead counts as a target, so these are no longer dead
+                // buttons just because the user has not tapped a block on the timeline.
+                hasClips = project.tracks.any { it.clips.isNotEmpty() },
+                onOpen = viewModel::openSheet,
+                onImport = { viewModel.setShowMediaImporterSheet(true) }
             )
         }
     ) { padding ->
@@ -152,13 +151,28 @@ fun EditorScreen(
                 }
             )
 
+            // ---------------- docked tool inspector
+            //
+            // Tools used to open a ModalBottomSheet with a full-screen scrim, so grading a clip
+            // hid the clip. The inspector is now an inline surface: the preview above keeps
+            // playing and repaints live while sliders move.
+            val inspectorOpen = state.openSheet.isInspector
+            if (inspectorOpen) {
+                EditorInspectorPanel(
+                    state = state,
+                    playheadMs = playheadMs,
+                    viewModel = viewModel,
+                    modifier = Modifier.fillMaxWidth().height(inspectorHeight())
+                )
+            }
+
             // ---------------- timeline
             if (project.mainVideoClips.isEmpty() && project.tracks.all { it.clips.isEmpty() }) {
                 com.vibecut.pro.ui.editor.timeline.TimelineEmptyHint(
                     onImport = { viewModel.setShowMediaImporterSheet(true) }
                 )
                 Spacer(Modifier.height(10.dp))
-            } else {
+            } else if (!inspectorOpen) {
                 ProTimeline(
                     project = project,
                     playheadMs = playheadMs,
@@ -240,6 +254,16 @@ fun EditorScreen(
 private fun timelineHeight(): androidx.compose.ui.unit.Dp {
     val screen = LocalConfiguration.current.screenHeightDp.dp
     return (screen * 0.27f).coerceIn(168.dp, 268.dp)
+}
+
+/**
+ * Height of the docked inspector. Capped at 42% of the screen so the video preview above it is
+ * always at least half the screen and never disappears behind the controls.
+ */
+@Composable
+private fun inspectorHeight(): androidx.compose.ui.unit.Dp {
+    val screen = LocalConfiguration.current.screenHeightDp.dp
+    return (screen * 0.42f).coerceIn(220.dp, 360.dp)
 }
 
 // ---------------------------------------------------------------------------- top bar
@@ -613,17 +637,12 @@ private fun TransportBar(
 
 @Composable
 private fun EditorDock(
-    hasSelection: Boolean,
+    activeSheet: EditorSheet,
     hasClips: Boolean,
-    onImport: () -> Unit,
-    onClip: () -> Unit,
-    onFilters: () -> Unit,
-    onAdjust: () -> Unit,
-    onEffects: () -> Unit,
-    onText: () -> Unit,
-    onAudio: () -> Unit,
-    onMore: () -> Unit
+    onOpen: (EditorSheet) -> Unit,
+    onImport: () -> Unit
 ) {
+    var showMore by remember { mutableStateOf(false) }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -631,6 +650,40 @@ private fun EditorDock(
             .navigationBarsPadding()
             .padding(vertical = 6.dp)
     ) {
+        if (showMore) {
+            // "More" used to silently open Transform. It is now a real overflow row that exposes
+            // every tool that had no entry point at all.
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                DockItem(Icons.Default.Transform, "Transform", hasClips, ZeroAccent, activeSheet == EditorSheet.TRANSFORM) {
+                    onOpen(EditorSheet.TRANSFORM); showMore = false
+                }
+                DockItem(Icons.Default.Speed, "Speed", hasClips, ZeroViolet, activeSheet == EditorSheet.SPEED) {
+                    onOpen(EditorSheet.SPEED); showMore = false
+                }
+                DockItem(Icons.Default.Deblur, "Detail", hasClips, ZeroBlue, activeSheet == EditorSheet.DETAIL) {
+                    onOpen(EditorSheet.DETAIL); showMore = false
+                }
+                DockItem(Icons.Default.SwapHoriz, "Transitions", hasClips, ZeroAmber, activeSheet == EditorSheet.TRANSITIONS) {
+                    onOpen(EditorSheet.TRANSITIONS); showMore = false
+                }
+                DockItem(Icons.Default.Timeline, "Keyframes", hasClips, ZeroAmber, activeSheet == EditorSheet.KEYFRAMES) {
+                    onOpen(EditorSheet.KEYFRAMES); showMore = false
+                }
+                DockItem(Icons.Default.HighQuality, "4K Enhance", true, ZeroAccent, activeSheet == EditorSheet.ENHANCE) {
+                    onOpen(EditorSheet.ENHANCE); showMore = false
+                }
+                DockItem(Icons.Default.Settings, "Project", true, TextPrimary, activeSheet == EditorSheet.PROJECT) {
+                    onOpen(EditorSheet.PROJECT); showMore = false
+                }
+            }
+            Spacer(Modifier.height(2.dp))
+        }
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -638,14 +691,29 @@ private fun EditorDock(
                 .padding(horizontal = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            DockItem(Icons.Default.AddPhotoAlternate, "Media", true, ZeroAccent, onImport)
-            DockItem(Icons.Default.ContentCut, "Clip", hasSelection, TextPrimary, onClip)
-            DockItem(Icons.Default.FilterVintage, "Filters", hasClips, ZeroAmber, onFilters)
-            DockItem(Icons.Default.Tune, "Adjust", hasClips, ZeroAccent, onAdjust)
-            DockItem(Icons.Default.AutoAwesome, "Effects", hasClips, ZeroViolet, onEffects)
-            DockItem(Icons.Default.TextFields, "Text", true, ZeroBlue, onText)
-            DockItem(Icons.Default.GraphicEq, "Audio", true, ZeroAccent, onAudio)
-            DockItem(Icons.Default.MoreHoriz, "More", hasSelection, TextPrimary, onMore)
+            DockItem(Icons.Default.AddPhotoAlternate, "Media", true, ZeroAccent, false, onImport)
+            DockItem(Icons.Default.ContentCut, "Clip", hasClips, TextPrimary, activeSheet == EditorSheet.CLIP) {
+                onOpen(EditorSheet.CLIP)
+            }
+            DockItem(Icons.Default.FilterVintage, "Filters", hasClips, ZeroAmber, activeSheet == EditorSheet.FILTERS) {
+                onOpen(EditorSheet.FILTERS)
+            }
+            DockItem(Icons.Default.Tune, "Adjust", hasClips, ZeroAccent, activeSheet == EditorSheet.ADJUST) {
+                onOpen(EditorSheet.ADJUST)
+            }
+            DockItem(Icons.Default.AutoAwesome, "Effects", hasClips, ZeroViolet, activeSheet == EditorSheet.EFFECTS) {
+                onOpen(EditorSheet.EFFECTS)
+            }
+            DockItem(Icons.Default.TextFields, "Text", true, ZeroBlue, activeSheet == EditorSheet.TEXT) {
+                onOpen(EditorSheet.TEXT)
+            }
+            DockItem(Icons.Default.GraphicEq, "Audio", true, ZeroAccent, activeSheet == EditorSheet.AUDIO) {
+                onOpen(EditorSheet.AUDIO)
+            }
+            DockItem(
+                if (showMore) Icons.Default.ExpandMore else Icons.Default.MoreHoriz,
+                "More", true, TextPrimary, showMore
+            ) { showMore = !showMore }
         }
     }
 }
@@ -656,12 +724,14 @@ private fun DockItem(
     label: String,
     enabled: Boolean,
     accent: Color,
+    active: Boolean = false,
     onClick: () -> Unit
 ) {
     Column(
         modifier = Modifier
             .width(62.dp)
             .clip(RoundedCornerShape(12.dp))
+            .background(if (active) accent.copy(alpha = 0.10f) else Color.Transparent)
             .clickable(enabled = enabled, onClick = onClick)
             .padding(vertical = 6.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -671,20 +741,35 @@ private fun DockItem(
             modifier = Modifier
                 .size(30.dp)
                 .clip(RoundedCornerShape(9.dp))
-                .background(if (enabled) accent.copy(alpha = 0.14f) else ZeroSurfaceHigh),
+                .background(
+                    when {
+                        active -> accent
+                        enabled -> accent.copy(alpha = 0.14f)
+                        else -> ZeroSurfaceHigh
+                    }
+                ),
             contentAlignment = Alignment.Center
         ) {
             Icon(
                 icon,
                 contentDescription = label,
-                tint = if (enabled) accent else TextTertiary,
+                tint = when {
+                    active -> ZeroBlack
+                    enabled -> accent
+                    else -> TextTertiary
+                },
                 modifier = Modifier.size(17.dp)
             )
         }
         Text(
             label,
             fontSize = 9.5.sp,
-            color = if (enabled) TextSecondary else TextTertiary,
+            fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
+            color = when {
+                active -> accent
+                enabled -> TextSecondary
+                else -> TextTertiary
+            },
             maxLines = 1
         )
     }

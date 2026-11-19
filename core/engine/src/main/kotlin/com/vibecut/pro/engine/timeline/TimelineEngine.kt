@@ -120,28 +120,58 @@ object TimelineEngine {
             return project
         }
         if (clip.mediaKind == MediaKind.TEXT_ELEMENT || clip.mediaKind == MediaKind.STICKER_ELEMENT) {
-            // Text/sticker clips split purely by timeline duration.
-            val left = clip.copy(trimEndMs = offsetInClipMs, transitionOut = null)
+            // Text/sticker clips are synthetic: they have no real media, so both halves get a
+            // self-consistent 0..duration source range *and* their keyframes are partitioned and
+            // rebased exactly like a media clip (previously the right half kept every keyframe and
+            // the left half kept a stale sourceDurationMs, so both halves rendered wrong).
+            val leftSpan = offsetInClipMs
+            val rightSpan = clip.timelineDurationMs - offsetInClipMs
+            val left = clip.copy(
+                sourceDurationMs = leftSpan,
+                trimStartMs = 0L,
+                trimEndMs = leftSpan,
+                transitionOut = null,
+                keyframes = clip.keyframes.filter { it.timeOffsetMs <= offsetInClipMs }
+            )
             val right = clip.copy(
                 id = UUID.randomUUID().toString(),
                 startTimeOnTrackMs = clip.startTimeOnTrackMs + offsetInClipMs,
+                sourceDurationMs = rightSpan,
                 trimStartMs = 0L,
-                trimEndMs = clip.timelineDurationMs - offsetInClipMs,
-                transitionIn = null
+                trimEndMs = rightSpan,
+                transitionIn = null,
+                keyframes = clip.keyframes
+                    .filter { it.timeOffsetMs > offsetInClipMs }
+                    .map {
+                        it.copy(
+                            id = UUID.randomUUID().toString(),
+                            timeOffsetMs = it.timeOffsetMs - offsetInClipMs
+                        )
+                    }
             )
             return updateTrack(project, track.id) { t ->
-                t.copy(clips = replaceClipWith(t.clips, clipId, listOf(left, right)).map {
-                    if (it.id == left.id) it.copy(sourceDurationMs = left.trimEndMs) else it
-                })
+                t.copy(clips = replaceClipWith(t.clips, clipId, listOf(left, right))
+                    .sortedBy { it.startTimeOnTrackMs })
             }
         }
 
         val splitSourceMs = clip.mapTimelineOffsetToSourceMs(offsetInClipMs)
         if (splitSourceMs <= clip.trimStartMs + 40L || splitSourceMs >= clip.effectiveTrimEndMs - 40L) return project
 
+        // A speed ramp is parameterised over the clip's own 0..1 source span, so each half has to
+        // keep the slice of the curve it actually covers, re-normalised to its new 0..1 range.
+        val splitSourceFraction = if (clip.trimmedSourceDurationMs > 0) {
+            ((splitSourceMs - clip.trimStartMs).toFloat() / clip.trimmedSourceDurationMs.toFloat())
+                .coerceIn(0f, 1f)
+        } else 0f
+        val leftCurve = resampleSpeedCurve(clip.activeSpeedPoints, 0f, splitSourceFraction)
+        val rightCurve = resampleSpeedCurve(clip.activeSpeedPoints, splitSourceFraction, 1f)
+
         val left = clip.copy(
             trimEndMs = splitSourceMs,
             transitionOut = null,
+            speedCurvePoints = leftCurve,
+            speedCurvePreset = if (leftCurve.isEmpty()) clip.speedCurvePreset else SpeedCurvePreset.NONE,
             keyframes = clip.keyframes.filter { it.timeOffsetMs <= offsetInClipMs }
         )
         val right = clip.copy(
@@ -149,6 +179,8 @@ object TimelineEngine {
             startTimeOnTrackMs = left.endTimeOnTrackMs,
             trimStartMs = splitSourceMs,
             transitionIn = null,
+            speedCurvePoints = rightCurve,
+            speedCurvePreset = if (rightCurve.isEmpty()) clip.speedCurvePreset else SpeedCurvePreset.NONE,
             effects = clip.effects.map { it.copy(id = UUID.randomUUID().toString()) },
             keyframes = clip.keyframes
                 .filter { it.timeOffsetMs > offsetInClipMs }
@@ -338,17 +370,18 @@ object TimelineEngine {
             clip.copy(transform = clip.transform.copy(rotationDegrees = next))
         }
 
-    /** Rotates in 90° steps and swaps the clip frame dimensions for portrait/landscape mixing. */
+    /**
+     * Rotates in 90° steps.
+     *
+     * This is **non-destructive**: `sourceWidth`/`sourceHeight` always describe the real decoded
+     * media and are never mutated. (Swapping them on every quarter turn permanently corrupted the
+     * clip's aspect after 4 rotations, because the swap was applied again on reload.) Consumers ask
+     * [TimelineClip.displayWidth]/[TimelineClip.displayHeight] for the post-rotation framing.
+     */
     fun rotateClipQuarterTurn(project: Project, clipId: String, clockwise: Boolean = true): Project {
         val track = project.findTrackForClip(clipId) ?: return project
         if (track.isLocked) return project
-        val rotated = rotateClip90(project, clipId, clockwise)
-        val clip = rotated.findClip(clipId) ?: return rotated
-        val quarterTurns = (clip.transform.rotationDegrees / 90f).roundToLong().toInt()
-        val swaps = abs(quarterTurns) % 2 == 1
-        val nextW = if (swaps) clip.sourceHeight else clip.sourceWidth
-        val nextH = if (swaps) clip.sourceWidth else clip.sourceHeight
-        return updateClip(rotated, clipId) { it.copy(sourceWidth = nextW, sourceHeight = nextH) }
+        return rotateClip90(project, clipId, clockwise)
     }
 
     fun setClipTransform(project: Project, clipId: String, transform: ClipTransform): Project =
@@ -748,6 +781,351 @@ object TimelineEngine {
         } else {
             track.copy(clips = clips.sortedBy { it.startTimeOnTrackMs })
         }
+
+    // ------------------------------------------------------------------ speed curve utilities
+
+    /**
+     * Extracts the `[from, to]` slice of a speed curve and re-normalises it to span 0..1, so that
+     * splitting a ramped clip keeps each half's instantaneous speed identical to the original.
+     */
+    fun resampleSpeedCurve(points: List<SpeedPoint>, from: Float, to: Float): List<SpeedPoint> {
+        if (points.size < 2) return emptyList()
+        val lo = from.coerceIn(0f, 1f)
+        val hi = to.coerceIn(0f, 1f)
+        if (hi - lo < 0.02f) return emptyList()
+        val sorted = points.sortedBy { it.normalizedPosition }
+        val span = hi - lo
+        val samples = 6
+        val out = ArrayList<SpeedPoint>(samples + 1)
+        for (i in 0..samples) {
+            val u = lo + span * (i.toFloat() / samples)
+            out += SpeedPoint(
+                normalizedPosition = i.toFloat() / samples,
+                speedMultiplier = TimelineClip.sampleSpeedCurve(sorted, u)
+                    .coerceIn(SpeedCurvePreset.MIN_SPEED, SpeedCurvePreset.MAX_SPEED)
+            )
+        }
+        return out
+    }
+
+    // ------------------------------------------------------------------ smart editing tools
+
+    /**
+     * **Auto-cut silence.** Removes every stretch of a clip quieter than [thresholdDb] for longer
+     * than [minSilenceMs], leaving [paddingMs] of headroom either side so speech is never clipped.
+     *
+     * [levelsDb] is a per-window loudness envelope of the clip's audio (dBFS, window =
+     * `clipDurationMs / levelsDb.size`), which the app computes with the PCM decoder.
+     * Returns the project unchanged when nothing is quiet enough to cut.
+     */
+    fun autoCutSilence(
+        project: Project,
+        clipId: String,
+        levelsDb: List<Float>,
+        thresholdDb: Float = -38f,
+        minSilenceMs: Long = 400L,
+        paddingMs: Long = 90L
+    ): Project {
+        if (levelsDb.size < 4) return project
+        val clip = project.findClip(clipId) ?: return project
+        val track = project.findTrackForClip(clipId) ?: return project
+        if (track.isLocked) return project
+        val duration = clip.timelineDurationMs
+        if (duration <= MIN_CLIP_DURATION_MS * 2) return project
+
+        val keep = planSilenceKeepRanges(duration, levelsDb, thresholdDb, minSilenceMs, paddingMs)
+        // Nothing to do when the whole clip survives as one piece.
+        if (keep.size == 1 && keep[0].first <= 0L && keep[0].second >= duration) return project
+        if (keep.isEmpty()) return project
+
+        // Rebuild the clip as N pieces in one pass: cutRangeFromClip() re-IDs the tail on every
+        // call, so looping over it would lose track of the clip after the first cut.
+        val pieces = keep.mapIndexed { index, (from, to) ->
+            val srcStart = clip.mapTimelineOffsetToSourceMs(from)
+            val srcEnd = clip.mapTimelineOffsetToSourceMs(to)
+            clip.copy(
+                id = if (index == 0) clip.id else UUID.randomUUID().toString(),
+                startTimeOnTrackMs = clip.startTimeOnTrackMs + from,
+                trimStartMs = min(srcStart, srcEnd),
+                trimEndMs = max(srcStart, srcEnd),
+                transitionIn = if (index == 0) clip.transitionIn else null,
+                transitionOut = if (index == keep.lastIndex) clip.transitionOut else null,
+                effects = if (index == 0) clip.effects
+                else clip.effects.map { it.copy(id = UUID.randomUUID().toString()) },
+                keyframes = clip.keyframes
+                    .filter { it.timeOffsetMs in from..to }
+                    .map {
+                        it.copy(
+                            id = if (index == 0) it.id else UUID.randomUUID().toString(),
+                            timeOffsetMs = it.timeOffsetMs - from
+                        )
+                    }
+            )
+        }.filter { it.trimmedSourceDurationMs >= MIN_CLIP_DURATION_MS }
+        if (pieces.size < 2) return project
+
+        return updateTrack(project, track.id) { t ->
+            maybeMagneticReflow(project, t, replaceClipWith(t.clips, clipId, pieces))
+        }
+    }
+
+    /**
+     * Pure helper behind [autoCutSilence]: converts a loudness envelope into the list of
+     * `(startMs, endMs)` windows worth keeping. Exposed so the behaviour is unit-testable.
+     */
+    fun planSilenceKeepRanges(
+        durationMs: Long,
+        levelsDb: List<Float>,
+        thresholdDb: Float = -38f,
+        minSilenceMs: Long = 400L,
+        paddingMs: Long = 90L
+    ): List<Pair<Long, Long>> {
+        if (levelsDb.isEmpty() || durationMs <= 0L) return emptyList()
+        val windowMs = durationMs.toDouble() / levelsDb.size
+
+        // 1. Collect raw silent runs.
+        val silences = mutableListOf<Pair<Long, Long>>()
+        var runStart = -1
+        levelsDb.forEachIndexed { index, db ->
+            val quiet = db <= thresholdDb
+            if (quiet && runStart < 0) runStart = index
+            if (!quiet && runStart >= 0) {
+                silences += runToMs(runStart, index - 1, windowMs, durationMs)
+                runStart = -1
+            }
+        }
+        if (runStart >= 0) silences += runToMs(runStart, levelsDb.lastIndex, windowMs, durationMs)
+
+        // 2. Keep only runs long enough to be worth cutting, then shrink them by the padding so
+        //    the first/last syllable at each boundary is never clipped off.
+        val cuts = silences
+            .filter { it.second - it.first >= minSilenceMs }
+            .map { (s, e) -> (s + paddingMs) to (e - paddingMs) }
+            .filter { it.second - it.first >= MIN_CLIP_DURATION_MS }
+            .sortedBy { it.first }
+        if (cuts.isEmpty()) return listOf(0L to durationMs)
+
+        // 3. Invert the cuts into keep ranges.
+        val keep = mutableListOf<Pair<Long, Long>>()
+        var cursor = 0L
+        cuts.forEach { (s, e) ->
+            if (s - cursor >= MIN_CLIP_DURATION_MS) keep += cursor to s
+            cursor = max(cursor, e)
+        }
+        if (durationMs - cursor >= MIN_CLIP_DURATION_MS) keep += cursor to durationMs
+        return keep
+    }
+
+    private fun runToMs(startIndex: Int, endIndex: Int, windowMs: Double, durationMs: Long): Pair<Long, Long> {
+        val start = (startIndex * windowMs).roundToLong().coerceIn(0L, durationMs)
+        val end = ((endIndex + 1) * windowMs).roundToLong().coerceIn(0L, durationMs)
+        return start to max(start, end)
+    }
+
+    /**
+     * **Beat sync.** Snaps every main-track cut point onto the nearest detected beat so clip
+     * boundaries land on the music. Only moves a boundary when a beat is within [toleranceMs].
+     */
+    fun snapCutsToBeats(project: Project, beatsMs: List<Long>, toleranceMs: Long = 260L): Project {
+        if (beatsMs.size < 2) return project
+        val track = project.trackByType(TrackType.VIDEO_MAIN) ?: return project
+        if (track.isLocked || track.clips.size < 2) return project
+        val sortedBeats = beatsMs.sorted()
+        val clips = track.clips.sortedBy { it.startTimeOnTrackMs }
+
+        var result = project
+        // Boundaries between clip i and i+1; walk forward so each retime ripples the rest.
+        for (i in 0 until clips.lastIndex) {
+            val current = result.findClip(clips[i].id) ?: continue
+            val boundary = current.endTimeOnTrackMs
+            val beat = sortedBeats.minByOrNull { abs(it - boundary) } ?: continue
+            val delta = beat - boundary
+            if (delta == 0L || abs(delta) > toleranceMs) continue
+            val newEndSource = current.mapTimelineOffsetToSourceMs(current.timelineDurationMs + delta)
+            val clamped = newEndSource.coerceIn(
+                current.trimStartMs + MIN_CLIP_DURATION_MS,
+                current.sourceDurationMs
+            )
+            if (clamped <= current.trimStartMs + MIN_CLIP_DURATION_MS) continue
+            result = trimClip(result, current.id, current.trimStartMs, clamped)
+        }
+        return result
+    }
+
+    /** Everything "copy attributes" transfers from one clip to another. */
+    data class ClipAttributes(
+        val colorGrade: ColorGradeConfig,
+        val effects: List<AppliedEffect>,
+        val transform: ClipTransform,
+        val crop: CropRect,
+        val chromaKey: ChromaKeyConfig,
+        val speed: Float,
+        val speedCurvePreset: SpeedCurvePreset,
+        val speedCurvePoints: List<SpeedPoint>,
+        val volume: Float,
+        val fadeInMs: Long,
+        val fadeOutMs: Long,
+        val noiseReduction: Float,
+        val voiceEnhancement: Float,
+        val transitionIn: ClipTransition?,
+        val transitionOut: ClipTransition?
+    )
+
+    /** Snapshots the reusable look/motion/audio attributes of [clipId]. */
+    fun copyClipAttributes(project: Project, clipId: String): ClipAttributes? {
+        val c = project.findClip(clipId) ?: return null
+        return ClipAttributes(
+            colorGrade = c.colorGrade,
+            effects = c.effects,
+            transform = c.transform,
+            crop = c.crop,
+            chromaKey = c.chromaKey,
+            speed = c.speed,
+            speedCurvePreset = c.speedCurvePreset,
+            speedCurvePoints = c.speedCurvePoints,
+            volume = c.volume,
+            fadeInMs = c.fadeInMs,
+            fadeOutMs = c.fadeOutMs,
+            noiseReduction = c.noiseReduction,
+            voiceEnhancement = c.voiceEnhancement,
+            transitionIn = c.transitionIn,
+            transitionOut = c.transitionOut
+        )
+    }
+
+    /**
+     * Pastes previously copied attributes onto [targetIds]. Each group can be toggled so a user can
+     * paste "just the grade" or "look + motion" without clobbering audio.
+     */
+    fun pasteClipAttributes(
+        project: Project,
+        targetIds: List<String>,
+        attrs: ClipAttributes,
+        includeLook: Boolean = true,
+        includeTransform: Boolean = true,
+        includeSpeed: Boolean = false,
+        includeAudio: Boolean = false,
+        includeTransitions: Boolean = false
+    ): Project {
+        if (targetIds.isEmpty()) return project
+        var result = project
+        targetIds.distinct().forEach { id ->
+            val track = result.findTrackForClip(id) ?: return@forEach
+            if (track.isLocked) return@forEach
+            result = updateClip(result, id) { clip ->
+                var next = clip
+                if (includeLook) {
+                    next = next.copy(
+                        colorGrade = attrs.colorGrade,
+                        effects = attrs.effects.map { it.copy(id = UUID.randomUUID().toString()) },
+                        chromaKey = attrs.chromaKey
+                    )
+                }
+                if (includeTransform) {
+                    next = next.copy(transform = attrs.transform, crop = attrs.crop)
+                }
+                if (includeSpeed && next.mediaKind == MediaKind.VIDEO) {
+                    next = next.copy(
+                        speed = attrs.speed.coerceIn(SpeedCurvePreset.MIN_SPEED, SpeedCurvePreset.MAX_SPEED),
+                        speedCurvePreset = attrs.speedCurvePreset,
+                        speedCurvePoints = attrs.speedCurvePoints
+                    )
+                }
+                if (includeAudio) {
+                    next = next.copy(
+                        volume = attrs.volume.coerceIn(0f, 2f),
+                        fadeInMs = attrs.fadeInMs,
+                        fadeOutMs = attrs.fadeOutMs,
+                        noiseReduction = attrs.noiseReduction.coerceIn(0f, 1f),
+                        voiceEnhancement = attrs.voiceEnhancement.coerceIn(0f, 1f)
+                    )
+                }
+                if (includeTransitions) {
+                    next = next.copy(transitionIn = attrs.transitionIn, transitionOut = attrs.transitionOut)
+                }
+                next
+            }
+        }
+        // Speed changes resize clips, so the magnetic main track must re-flow.
+        val main = result.trackByType(TrackType.VIDEO_MAIN)
+        return if (includeSpeed && main != null && result.magneticTimeline) {
+            updateTrack(result, main.id) { it.copy(clips = reflowMagneticClips(it.clips)) }
+        } else {
+            result
+        }
+    }
+
+    /**
+     * **Auto transitions.** Drops the same transition between every adjacent pair on the main
+     * track in one action — the single most requested "make it look edited" button.
+     */
+    fun applyTransitionToAllCuts(
+        project: Project,
+        type: TransitionType,
+        durationMs: Long = type.defaultDurationMs
+    ): Project {
+        val track = project.trackByType(TrackType.VIDEO_MAIN) ?: return project
+        if (track.isLocked || track.clips.size < 2) return project
+        val ordered = track.clips.sortedBy { it.startTimeOnTrackMs }
+        var result = project
+        for (i in 0 until ordered.lastIndex) {
+            val a = ordered[i]
+            val b = ordered[i + 1]
+            val safe = durationMs.coerceIn(
+                100L,
+                minOf(a.timelineDurationMs, b.timelineDurationMs) / 2
+            )
+            if (safe < 100L) continue
+            val transition = ClipTransition(type = type, durationMs = safe)
+            result = updateClip(result, a.id) { it.copy(transitionOut = transition) }
+            result = updateClip(result, b.id) { it.copy(transitionIn = transition) }
+        }
+        return result
+    }
+
+    /** Clears every transition on the main track. */
+    fun clearAllTransitions(project: Project): Project {
+        val track = project.trackByType(TrackType.VIDEO_MAIN) ?: return project
+        return updateTrack(project, track.id) { t ->
+            t.copy(clips = t.clips.map { it.copy(transitionIn = null, transitionOut = null) })
+        }
+    }
+
+    /**
+     * **Auto-captions.** Turns a list of detected speech windows into real text clips on the TEXT
+     * track, styled with the given spec, so captions are editable like any other element.
+     */
+    fun buildCaptionClips(
+        project: Project,
+        cues: List<SubtitleCue>,
+        style: TextStyleSpec = TextStyleSpec()
+    ): Project {
+        if (cues.isEmpty()) return project
+        val track = project.tracks.firstOrNull { it.type == TrackType.TEXT && !it.isLocked }
+            ?: return project
+        val existing = track.clips.filterNot { it.sourceName == CAPTION_SOURCE_NAME }
+        val captions = cues.sortedBy { it.startTimeMs }.map { cue ->
+            val span = max(MIN_CLIP_DURATION_MS, cue.endTimeMs - cue.startTimeMs)
+            TimelineClip(
+                trackId = track.id,
+                sourceUri = "zero://caption",
+                sourceName = CAPTION_SOURCE_NAME,
+                mediaKind = MediaKind.TEXT_ELEMENT,
+                sourceDurationMs = span,
+                startTimeOnTrackMs = max(0L, cue.startTimeMs),
+                trimStartMs = 0L,
+                trimEndMs = span,
+                hasAudioTrack = false,
+                textSpec = style.copy(text = cue.text, languageTag = cue.languageTag),
+                transform = ClipTransform(positionY = 0.62f)
+            )
+        }
+        return updateTrack(project, track.id) { t ->
+            t.copy(clips = (existing + captions).sortedBy { it.startTimeOnTrackMs })
+        }
+    }
+
+    const val CAPTION_SOURCE_NAME = "Auto Caption"
 }
 
 data class ImportedMediaSource(

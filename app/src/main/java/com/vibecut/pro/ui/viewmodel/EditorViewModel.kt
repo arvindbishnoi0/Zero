@@ -1182,6 +1182,240 @@ class EditorViewModel @Inject constructor(
         }
     }
 
+    // ------------------------------------------------------------------ keyframe editing
+
+    /** Changes the value of an existing keyframe (the old UI could only add and delete). */
+    fun updateKeyframeValue(keyframeId: String, value: Float) {
+        val clip = targetClip() ?: return
+        val existing = clip.keyframes.firstOrNull { it.id == keyframeId } ?: return
+        applyCoalescedMutation("kf_$keyframeId", "Keyframe ${existing.property.label}", clip.id) { proj ->
+            TimelineEngine.upsertKeyframe(
+                proj, clip.id,
+                existing.copy(value = value.coerceIn(existing.property.minValue, existing.property.maxValue))
+            )
+        }
+    }
+
+    /** Changes the easing curve of an existing keyframe. */
+    fun updateKeyframeEasing(keyframeId: String, easing: EasingCurve) {
+        val clip = targetClip() ?: return
+        val existing = clip.keyframes.firstOrNull { it.id == keyframeId } ?: return
+        applyMutation("Keyframe easing: ${easing.label}", newSelectedClipId = clip.id) { proj ->
+            TimelineEngine.upsertKeyframe(proj, clip.id, existing.copy(easing = easing))
+        }
+    }
+
+    /** Slides a keyframe along the clip's own timeline. */
+    fun moveKeyframeTime(keyframeId: String, newOffsetMs: Long) {
+        val clip = targetClip() ?: return
+        val existing = clip.keyframes.firstOrNull { it.id == keyframeId } ?: return
+        val clamped = newOffsetMs.coerceIn(0L, clip.timelineDurationMs)
+        applyCoalescedMutation("kft_$keyframeId", "Move keyframe", clip.id) { proj ->
+            TimelineEngine.upsertKeyframe(proj, clip.id, existing.copy(timeOffsetMs = clamped))
+        }
+    }
+
+    /** Slow push-in across the whole clip — the classic photo-montage move. */
+    fun applyKenBurnsPreset() {
+        val clip = targetClip() ?: return
+        val end = clip.timelineDurationMs
+        applyMutation("Ken Burns", newSelectedClipId = clip.id) { proj ->
+            var next = TimelineEngine.clearKeyframes(proj, clip.id)
+            next = TimelineEngine.upsertKeyframe(next, clip.id, Keyframe(property = KeyframeProperty.SCALE, timeOffsetMs = 0L, value = 1.0f, easing = EasingCurve.LINEAR))
+            next = TimelineEngine.upsertKeyframe(next, clip.id, Keyframe(property = KeyframeProperty.SCALE, timeOffsetMs = end, value = 1.18f, easing = EasingCurve.LINEAR))
+            next = TimelineEngine.upsertKeyframe(next, clip.id, Keyframe(property = KeyframeProperty.POSITION_X, timeOffsetMs = 0L, value = -0.04f, easing = EasingCurve.LINEAR))
+            TimelineEngine.upsertKeyframe(next, clip.id, Keyframe(property = KeyframeProperty.POSITION_X, timeOffsetMs = end, value = 0.04f, easing = EasingCurve.LINEAR))
+        }
+        notifyToast("Ken Burns added")
+    }
+
+    fun applyFadePreset(fadeIn: Boolean) {
+        val clip = targetClip() ?: return
+        val span = minOf(600L, clip.timelineDurationMs / 3).coerceAtLeast(120L)
+        applyMutation(if (fadeIn) "Fade in" else "Fade out", newSelectedClipId = clip.id) { proj ->
+            val a = if (fadeIn) 0L else clip.timelineDurationMs - span
+            val b = if (fadeIn) span else clip.timelineDurationMs
+            var next = TimelineEngine.upsertKeyframe(proj, clip.id, Keyframe(property = KeyframeProperty.OPACITY, timeOffsetMs = a, value = if (fadeIn) 0f else 1f, easing = EasingCurve.EASE_IN_OUT))
+            next = TimelineEngine.upsertKeyframe(next, clip.id, Keyframe(property = KeyframeProperty.OPACITY, timeOffsetMs = b, value = if (fadeIn) 1f else 0f, easing = EasingCurve.EASE_IN_OUT))
+            next
+        }
+    }
+
+    fun applyPopInPreset() {
+        val clip = targetClip() ?: return
+        applyMutation("Pop in", newSelectedClipId = clip.id) { proj ->
+            var next = TimelineEngine.upsertKeyframe(proj, clip.id, Keyframe(property = KeyframeProperty.SCALE, timeOffsetMs = 0L, value = 0.6f, easing = EasingCurve.SNAP))
+            next = TimelineEngine.upsertKeyframe(next, clip.id, Keyframe(property = KeyframeProperty.SCALE, timeOffsetMs = 320L, value = 1f, easing = EasingCurve.SNAP))
+            next = TimelineEngine.upsertKeyframe(next, clip.id, Keyframe(property = KeyframeProperty.OPACITY, timeOffsetMs = 0L, value = 0f, easing = EasingCurve.EASE_OUT))
+            TimelineEngine.upsertKeyframe(next, clip.id, Keyframe(property = KeyframeProperty.OPACITY, timeOffsetMs = 220L, value = 1f, easing = EasingCurve.EASE_OUT))
+        }
+    }
+
+    // ------------------------------------------------------------------ smart editing tools
+
+    /** Drops one transition on every cut of the main track in a single action. */
+    fun applyTransitionToAllCuts(type: TransitionType) {
+        val cuts = (session.currentProject.mainVideoClips.size - 1).coerceAtLeast(0)
+        if (cuts == 0) {
+            notifyToast("Need at least two clips")
+            return
+        }
+        applyMutation("${type.label} on all cuts") {
+            TimelineEngine.applyTransitionToAllCuts(it, type)
+        }
+        notifyToast("${type.label} applied to $cuts cut${if (cuts == 1) "" else "s"}")
+    }
+
+    fun clearAllTransitions() {
+        applyMutation("Clear transitions") { TimelineEngine.clearAllTransitions(it) }
+        notifyToast("Transitions cleared")
+    }
+
+    /**
+     * **Auto-cut silence.** Decodes the clip's audio, turns the peak envelope into a dBFS
+     * loudness curve and removes every quiet gap, so talking-head footage tightens up in one tap.
+     */
+    fun autoCutSilenceOnSelected() {
+        val clip = targetClip() ?: run { notifyToast("Select a clip first"); return }
+        if (!clip.hasAudioTrack) {
+            notifyToast("This clip has no audio")
+            return
+        }
+        viewModelScope.launch {
+            notifyToast("Listening for silence...")
+            val summary = mediaAudioTools.analyzeAudioTrack(clip.sourceUri)
+            val levelsDb = summary.beatAnalysis.peakEnvelope.map { peak ->
+                if (peak <= 0.0001f) -90f else (20.0 * kotlin.math.log10(peak.toDouble())).toFloat()
+            }
+            if (levelsDb.size < 8) {
+                notifyToast("Could not read the audio")
+                return@launch
+            }
+            val before = session.currentProject.findTrackForClip(clip.id)?.clips?.size ?: 0
+            applyMutation("Auto-cut silence", newSelectedClipId = clip.id) { proj ->
+                TimelineEngine.autoCutSilence(proj, clip.id, levelsDb)
+            }
+            val after = session.currentProject.findTrackForClip(clip.id)?.clips?.size ?: before
+            if (after > before) {
+                notifyToast("Removed ${after - before} silent gap${if (after - before == 1) "" else "s"}")
+            } else {
+                notifyToast("No silence long enough to cut")
+            }
+            saveImmediately("Auto-cut silence")
+        }
+    }
+
+    /** Nudges every cut on the main track onto the nearest detected beat. */
+    fun snapCutsToBeats() {
+        val beats = session.currentProject.tracks
+            .flatMap { it.clips }
+            .firstOrNull { it.beatMarkersMs.size >= 2 }
+            ?.beatMarkersMs
+        if (beats == null) {
+            notifyToast("Run 'Detect beats' first")
+            return
+        }
+        applyMutation("Snap cuts to beats") { TimelineEngine.snapCutsToBeats(it, beats) }
+        notifyToast("Cuts snapped to the beat")
+    }
+
+    /**
+     * **Auto captions.** Uses the voice-activity windows from the decoder to lay real, editable
+     * text clips on the TEXT track.
+     */
+    fun generateAutoCaptions() {
+        val clip = targetClip() ?: session.currentProject.mainVideoClips.firstOrNull()
+        if (clip == null) {
+            notifyToast("Add a clip first")
+            return
+        }
+        viewModelScope.launch {
+            notifyToast("Detecting speech...")
+            val summary = mediaAudioTools.analyzeAudioTrack(clip.sourceUri)
+            val cues = summary.vadIntervalsMs
+                .filter { it.last - it.first >= 400L }
+                .mapIndexed { index, range ->
+                    SubtitleCue(
+                        text = "Caption ${index + 1}",
+                        startTimeMs = clip.startTimeOnTrackMs + range.first,
+                        endTimeMs = clip.startTimeOnTrackMs + range.last
+                    )
+                }
+            if (cues.isEmpty()) {
+                notifyToast("No speech detected")
+                return@launch
+            }
+            applyMutation("Auto captions") { proj ->
+                TimelineEngine.buildCaptionClips(
+                    proj,
+                    cues,
+                    TextStyleSpec(
+                        templateId = "subtitle",
+                        fontSizeSp = 22f,
+                        outlineWidth = 2f,
+                        outlineColorArgb = 0xCC000000
+                    )
+                ).copy(subtitles = cues)
+            }
+            notifyToast("${cues.size} caption placeholders added — tap each to edit")
+        }
+    }
+
+    // ------------------------------------------------------------------ copy / paste attributes
+
+    private var copiedAttributes: TimelineEngine.ClipAttributes? = null
+
+    val hasCopiedAttributes: Boolean get() = copiedAttributes != null
+
+    fun copySelectedClipAttributes() {
+        val clip = targetClip() ?: run { notifyToast("Select a clip first"); return }
+        copiedAttributes = TimelineEngine.copyClipAttributes(session.currentProject, clip.id)
+        notifyToast(if (copiedAttributes != null) "Look copied from ${clip.sourceName}" else "Nothing to copy")
+    }
+
+    fun pasteAttributesOnSelected() {
+        val attrs = copiedAttributes ?: run { notifyToast("Copy a clip's look first"); return }
+        val clip = targetClip() ?: return
+        applyMutation("Paste look", newSelectedClipId = clip.id) {
+            TimelineEngine.pasteClipAttributes(it, listOf(clip.id), attrs)
+        }
+        notifyToast("Look pasted")
+    }
+
+    fun pasteAttributesToAllClips() {
+        val attrs = copiedAttributes ?: run { notifyToast("Copy a clip's look first"); return }
+        val ids = session.currentProject.mainVideoClips.map { it.id }
+        if (ids.isEmpty()) return
+        applyMutation("Paste look to all") {
+            TimelineEngine.pasteClipAttributes(it, ids, attrs)
+        }
+        notifyToast("Look pasted to ${ids.size} clips")
+    }
+
+    // ------------------------------------------------------------------ track solo
+
+    private val soloedTrackIds = MutableStateFlow<Set<String>>(emptySet())
+
+    fun isTrackSoloed(trackId: String): Boolean = trackId in soloedTrackIds.value
+
+    /**
+     * Real solo: muting every other audio track, and restoring them when solo is released.
+     * (The Solo chip used to be wired to an empty lambda.)
+     */
+    fun toggleTrackSolo(trackId: String) {
+        val wasSoloed = trackId in soloedTrackIds.value
+        val next = if (wasSoloed) emptySet() else setOf(trackId)
+        soloedTrackIds.value = next
+        applyMutation(if (wasSoloed) "Unsolo track" else "Solo track") { proj ->
+            proj.copy(
+                tracks = proj.tracks.map { track ->
+                    if (!track.type.isAudioTrack) track
+                    else track.copy(isMuted = next.isNotEmpty() && track.id !in next)
+                }
+            )
+        }
+    }
+
     // ------------------------------------------------------------------ enhancement
 
     fun updateEnhancement(config: EnhancementConfig) {
@@ -1238,6 +1472,12 @@ class EditorViewModel @Inject constructor(
         audioOnly: Boolean,
         isPhotoFrame: Boolean = false
     ): Intent? = exportEngine.buildShareIntent(path, audioOnly, isPhotoFrame)
+
+    fun buildViewExportIntent(
+        path: String,
+        audioOnly: Boolean,
+        isPhotoFrame: Boolean = false
+    ): Intent? = exportEngine.buildViewIntent(path, audioOnly, isPhotoFrame)
 
     override fun onCleared() {
         super.onCleared()

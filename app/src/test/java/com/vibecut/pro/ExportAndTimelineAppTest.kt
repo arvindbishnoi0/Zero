@@ -61,7 +61,7 @@ class ExportAndTimelineAppTest {
 
     @Test
     fun effectStackingAndApplyToAllClipsPreserveIntegrity() {
-        var project = Project(title = "ZERO Reel", aspectRatio = AspectRatioPreset.WIDE_16_9)
+        var project = Project(title = "ZERO Reel", aspectRatio = AspectRatioPreset.YOUTUBE_16_9)
         val media = listOf(
             ImportedMediaSource("file:///a.mp4", "Scene A", MediaKind.VIDEO, 5_000L, hasAudioTrack = true),
             ImportedMediaSource("file:///b.mp4", "Scene B", MediaKind.VIDEO, 5_000L, hasAudioTrack = false)
@@ -151,8 +151,9 @@ class ExportAndTimelineAppTest {
         project = TimelineEngine.importMediaClips(
             project,
             listOf(
-                ImportedMediaSource("file:///a.mp4", "A", MediaKind.VIDEO, 6_000L),
-                ImportedMediaSource("file:///b.mp4", "B", MediaKind.VIDEO, 4_000L)
+                ImportedMediaSource("file:///a.mp4", "A", MediaKind.VIDEO, 6_000L, hasAudioTrack = true),
+                // B is deliberately silent — the assertion below is about skipping it.
+                ImportedMediaSource("file:///b.mp4", "B", MediaKind.VIDEO, 4_000L, hasAudioTrack = false)
             ),
             TrackType.VIDEO_MAIN
         )
@@ -165,9 +166,11 @@ class ExportAndTimelineAppTest {
         }
         assertEquals(project.totalDurationMs, ExportSegmentPlanner.totalExportDurationMs(project))
 
-        // Audio planning must skip silent clips entirely.
+        // Audio planning must skip silent clips entirely. The fixture previously imported B with
+        // the default `hasAudioTrack = true`, so this asserted the opposite of what it set up.
         val audio = ExportSegmentPlanner.planAudioTracks(project)
         assertTrue(audio.all { it.clip.hasAudioTrack })
-        assertFalse(audio.any { it.clip.sourceName == "B" })
+        assertTrue("the clip with audio must be planned", audio.any { it.clip.sourceName == "A" })
+        assertFalse("the silent clip must be skipped", audio.any { it.clip.sourceName == "B" })
     }
 }

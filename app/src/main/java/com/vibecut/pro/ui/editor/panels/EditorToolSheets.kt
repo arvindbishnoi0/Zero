@@ -4,6 +4,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -16,10 +18,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.vibecut.pro.engine.audio.BuiltInSfxPreset
 import com.vibecut.pro.engine.model.*
 import com.vibecut.pro.ui.theme.*
 import com.vibecut.pro.ui.viewmodel.EditorSheet
@@ -27,8 +31,237 @@ import com.vibecut.pro.ui.viewmodel.EditorUiState
 import com.vibecut.pro.ui.viewmodel.EditorViewModel
 
 /**
- * Host for all editor tool sheets. Exactly one sheet is open at a time, each with its own title,
- * live controls and Done/Reset actions — no long scrolling inspector pages, no hidden tools.
+ * Which tools live in the **docked inspector** (preview stays visible) and which are real modals.
+ *
+ * Export and project settings are one-shot tasks where nothing needs to be watched live; every
+ * other tool changes pixels, so it must never cover the picture it is editing.
+ */
+val EditorSheet.isInspector: Boolean
+    get() = this != EditorSheet.NONE && this != EditorSheet.EXPORT &&
+        this != EditorSheet.PROJECT && this != EditorSheet.MEDIA
+
+internal fun sheetTitle(sheet: EditorSheet): String = when (sheet) {
+    EditorSheet.MEDIA -> "Add media"
+    EditorSheet.CLIP -> "Clip"
+    EditorSheet.TRANSFORM -> "Transform"
+    EditorSheet.SPEED -> "Speed"
+    EditorSheet.FILTERS -> "Filters"
+    EditorSheet.ADJUST -> "Color"
+    EditorSheet.DETAIL -> "Detail"
+    EditorSheet.EFFECTS -> "Effects"
+    EditorSheet.TRANSITIONS -> "Transitions"
+    EditorSheet.TEXT -> "Text"
+    EditorSheet.AUDIO -> "Audio"
+    EditorSheet.KEYFRAMES -> "Keyframes"
+    EditorSheet.ENHANCE -> "Enhance"
+    EditorSheet.EXPORT -> "Export"
+    EditorSheet.PROJECT -> "Project"
+    EditorSheet.NONE -> ""
+}
+
+private fun sheetIcon(sheet: EditorSheet): ImageVector = when (sheet) {
+    EditorSheet.CLIP -> Icons.Default.ContentCut
+    EditorSheet.TRANSFORM -> Icons.Default.Transform
+    EditorSheet.SPEED -> Icons.Default.Speed
+    EditorSheet.FILTERS -> Icons.Default.FilterVintage
+    EditorSheet.ADJUST -> Icons.Default.Tune
+    EditorSheet.DETAIL -> Icons.Default.Deblur
+    EditorSheet.EFFECTS -> Icons.Default.AutoAwesome
+    EditorSheet.TRANSITIONS -> Icons.Default.SwapHoriz
+    EditorSheet.TEXT -> Icons.Default.TextFields
+    EditorSheet.AUDIO -> Icons.Default.GraphicEq
+    EditorSheet.KEYFRAMES -> Icons.Default.Timeline
+    EditorSheet.ENHANCE -> Icons.Default.HighQuality
+    else -> Icons.Default.Tune
+}
+
+/** Order of the quick-switch rail at the top of the inspector. */
+private val INSPECTOR_RAIL = listOf(
+    EditorSheet.CLIP,
+    EditorSheet.FILTERS,
+    EditorSheet.ADJUST,
+    EditorSheet.DETAIL,
+    EditorSheet.EFFECTS,
+    EditorSheet.TRANSFORM,
+    EditorSheet.SPEED,
+    EditorSheet.TRANSITIONS,
+    EditorSheet.KEYFRAMES,
+    EditorSheet.TEXT,
+    EditorSheet.AUDIO,
+    EditorSheet.ENHANCE
+)
+
+/**
+ * **Docked tool inspector.**
+ *
+ * Previously every tool opened a `ModalBottomSheet` with a full-screen scrim, so the moment you
+ * touched a colour slider the video you were grading disappeared behind the panel. This is a plain
+ * inline surface: the preview above it keeps playing and updating live while you drag a slider.
+ *
+ * It also carries a horizontal rail so the user can hop between tools without closing anything,
+ * and it exposes every tool that used to be unreachable (Detail, Transitions, Keyframes, Enhance).
+ */
+@Composable
+fun EditorInspectorPanel(
+    state: EditorUiState,
+    playheadMs: Long,
+    viewModel: EditorViewModel,
+    modifier: Modifier = Modifier
+) {
+    val sheet = state.openSheet
+    if (!sheet.isInspector) return
+    val clip = state.selectedClip ?: state.project.findMainClipAt(playheadMs)
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(ZeroBackground)
+            .border(width = 1.dp, color = ZeroStroke, shape = RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp))
+            .clip(RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp))
+    ) {
+        // ---- quick-switch rail -------------------------------------------------------------
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(ZeroSurface)
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 8.dp, vertical = 5.dp),
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            INSPECTOR_RAIL.forEach { tool ->
+                val active = tool == sheet
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(if (active) ZeroAccent else ZeroSurfaceHigh)
+                        .clickable { viewModel.openSheet(tool) }
+                        .padding(horizontal = 9.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Icon(
+                        sheetIcon(tool),
+                        contentDescription = sheetTitle(tool),
+                        tint = if (active) ZeroBlack else TextSecondary,
+                        modifier = Modifier.size(13.dp)
+                    )
+                    Text(
+                        sheetTitle(tool),
+                        fontSize = 10.sp,
+                        fontWeight = if (active) FontWeight.Bold else FontWeight.Medium,
+                        color = if (active) ZeroBlack else TextSecondary
+                    )
+                }
+            }
+        }
+
+        // ---- header ------------------------------------------------------------------------
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 14.dp, end = 8.dp, top = 8.dp, bottom = 2.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    sheetTitle(sheet),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = TextPrimary
+                )
+                Text(
+                    text = clip?.let { "${it.sourceName} · ${formatDurationShort(it.timelineDurationMs)}" }
+                        ?: "No clip selected",
+                    fontSize = 9.sp,
+                    color = TextTertiary,
+                    maxLines = 1
+                )
+            }
+            // Reset only where a reset means something.
+            if (sheet.hasReset) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { resetForSheet(sheet, viewModel) }
+                        .padding(horizontal = 9.dp, vertical = 6.dp)
+                ) {
+                    Text("Reset", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = ZeroCoral)
+                }
+            }
+            Box(
+                modifier = Modifier
+                    .size(30.dp)
+                    .clip(RoundedCornerShape(9.dp))
+                    .clickable(onClick = viewModel::closeSheet),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(Icons.Default.KeyboardArrowDown, "Close inspector", tint = TextSecondary, modifier = Modifier.size(20.dp))
+            }
+        }
+
+        // ---- body --------------------------------------------------------------------------
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 14.dp, vertical = 6.dp)
+        ) {
+            InspectorBody(sheet, clip, state, playheadMs, viewModel)
+            Spacer(Modifier.height(10.dp))
+        }
+    }
+}
+
+private val EditorSheet.hasReset: Boolean
+    get() = this in setOf(
+        EditorSheet.FILTERS, EditorSheet.ADJUST, EditorSheet.DETAIL, EditorSheet.EFFECTS,
+        EditorSheet.TRANSFORM, EditorSheet.TRANSITIONS, EditorSheet.SPEED, EditorSheet.KEYFRAMES
+    )
+
+private fun resetForSheet(sheet: EditorSheet, viewModel: EditorViewModel) {
+    when (sheet) {
+        EditorSheet.FILTERS, EditorSheet.ADJUST, EditorSheet.DETAIL -> viewModel.resetAllGradingOnSelected()
+        EditorSheet.EFFECTS -> viewModel.clearEffectsOnSelected()
+        EditorSheet.TRANSFORM -> viewModel.updateSelectedTransform(ClipTransform())
+        EditorSheet.TRANSITIONS -> viewModel.setTransitionOnSelected(null)
+        EditorSheet.SPEED -> viewModel.updateSelectedSpeed(1f)
+        EditorSheet.KEYFRAMES -> viewModel.clearKeyframesOnSelected()
+        else -> Unit
+    }
+}
+
+@Composable
+private fun InspectorBody(
+    sheet: EditorSheet,
+    clip: TimelineClip?,
+    state: EditorUiState,
+    playheadMs: Long,
+    viewModel: EditorViewModel
+) {
+    when (sheet) {
+        EditorSheet.CLIP -> ClipToolSheet(clip, state.project, viewModel)
+        EditorSheet.TRANSFORM -> TransformSheet(clip, viewModel, state.project)
+        EditorSheet.SPEED -> SpeedSheet(clip, playheadMs, viewModel)
+        EditorSheet.FILTERS -> FilterSheet(clip, state.project, viewModel)
+        EditorSheet.ADJUST -> AdjustSheet(clip, viewModel)
+        EditorSheet.DETAIL -> DetailSheet(clip, viewModel)
+        EditorSheet.EFFECTS -> EffectsSheet(clip, state.project, viewModel)
+        EditorSheet.TRANSITIONS -> TransitionSheet(clip, state.project, viewModel)
+        EditorSheet.TEXT -> TextSheet(clip, state.project, viewModel)
+        EditorSheet.AUDIO -> AudioSheet(
+            clip, state.project, playheadMs,
+            state.isVoiceRecording, state.voiceAmplitude, viewModel
+        )
+        EditorSheet.KEYFRAMES -> KeyframeSheet(clip, playheadMs, viewModel)
+        EditorSheet.ENHANCE -> EnhanceSheet(state.project, viewModel)
+        else -> Unit
+    }
+}
+
+/**
+ * The two genuinely modal surfaces: export and project settings. Everything else is docked.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -38,8 +271,7 @@ fun EditorToolSheets(
     viewModel: EditorViewModel
 ) {
     val sheet = state.openSheet
-    if (sheet == EditorSheet.NONE) return
-    val clip = state.selectedClip ?: state.project.findMainClipAt(playheadMs)
+    if (sheet != EditorSheet.EXPORT && sheet != EditorSheet.PROJECT) return
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     ModalBottomSheet(
@@ -60,97 +292,34 @@ fun EditorToolSheets(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(max = 560.dp)
+                .heightIn(max = 620.dp)
                 .padding(horizontal = 14.dp)
         ) {
-            val title = when (sheet) {
-                EditorSheet.MEDIA -> "Add media"
-                EditorSheet.CLIP -> "Clip tools"
-                EditorSheet.TRANSFORM -> "Transform"
-                EditorSheet.SPEED -> "Speed"
-                EditorSheet.FILTERS -> "Filters"
-                EditorSheet.ADJUST -> "Color adjust"
-                EditorSheet.DETAIL -> "Detail & finishing"
-                EditorSheet.EFFECTS -> "Effects"
-                EditorSheet.TRANSITIONS -> "Transitions"
-                EditorSheet.TEXT -> "Text & captions"
-                EditorSheet.AUDIO -> "Audio & mixing"
-                EditorSheet.KEYFRAMES -> "Motion & keyframes"
-                EditorSheet.ENHANCE -> "4K enhancer"
-                EditorSheet.EXPORT -> "Export"
-                EditorSheet.PROJECT -> "Project settings"
-                EditorSheet.NONE -> ""
-            }
-            val subtitle = when {
-                sheet == EditorSheet.PROJECT || sheet == EditorSheet.EXPORT -> state.project.title
-                clip != null -> "${clip.sourceName} · ${formatDurationShort(clip.timelineDurationMs)}"
-                else -> "No clip selected"
-            }
-
-            SheetHeader(title = title, subtitle = subtitle, onClose = viewModel::closeSheet)
-
+            SheetHeader(
+                title = if (sheet == EditorSheet.EXPORT) "Export" else "Project settings",
+                subtitle = state.project.title,
+                onClose = viewModel::closeSheet
+            )
             Spacer(Modifier.height(10.dp))
-
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f, fill = false)
                     .verticalScroll(rememberScrollState())
             ) {
-                when (sheet) {
-                    EditorSheet.CLIP -> ClipToolSheet(clip, state.project, viewModel)
-                    EditorSheet.TRANSFORM -> TransformSheet(clip, viewModel, state.project)
-                    EditorSheet.SPEED -> SpeedSheet(clip, playheadMs, viewModel)
-                    EditorSheet.FILTERS -> FilterSheet(clip, state.project, viewModel)
-                    EditorSheet.ADJUST -> AdjustSheet(clip, viewModel)
-                    EditorSheet.DETAIL -> DetailSheet(clip, viewModel)
-                    EditorSheet.EFFECTS -> EffectsSheet(clip, state.project, viewModel)
-                    EditorSheet.TRANSITIONS -> TransitionSheet(clip, viewModel)
-                    EditorSheet.TEXT -> TextSheet(clip, state.project, viewModel)
-                    EditorSheet.AUDIO -> AudioSheet(clip, state.project, playheadMs, viewModel)
-                    EditorSheet.KEYFRAMES -> KeyframeSheet(clip, playheadMs, viewModel)
-                    EditorSheet.ENHANCE -> EnhanceSheet(state.project, viewModel)
-                    EditorSheet.EXPORT -> ExportSheet(state.project, viewModel)
-                    EditorSheet.PROJECT -> ProjectSheet(state.project, viewModel)
-                    else -> Unit
+                if (sheet == EditorSheet.EXPORT) {
+                    ExportSheet(state.project, viewModel)
+                } else {
+                    ProjectSheet(state.project, viewModel)
                 }
             }
-
             Spacer(Modifier.height(8.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                if (sheet != EditorSheet.EXPORT && sheet != EditorSheet.PROJECT) {
-                    StudioPrimaryButton(
-                        text = "Reset",
-                        icon = Icons.Default.Refresh,
-                        container = ZeroSurfaceHigh,
-                        contentColor = TextPrimary,
-                        onClick = {
-                            @Suppress("UNUSED_EXPRESSION")
-                            when (sheet) {
-                                EditorSheet.FILTERS, EditorSheet.ADJUST, EditorSheet.DETAIL ->
-                                    viewModel.resetAllGradingOnSelected()
-                                EditorSheet.EFFECTS -> viewModel.clearEffectsOnSelected()
-                                EditorSheet.TRANSFORM -> viewModel.updateSelectedTransform(ClipTransform())
-                                EditorSheet.TRANSITIONS -> viewModel.setTransitionOnSelected(null)
-                                EditorSheet.SPEED -> viewModel.updateSelectedSpeed(1f)
-                                EditorSheet.KEYFRAMES -> viewModel.clearKeyframesOnSelected()
-                                else -> Unit
-                            }
-                        },
-                        modifier = Modifier.weight(1f)
-                    )
-                }
-                StudioPrimaryButton(
-                    text = "Done",
-                    icon = Icons.Default.Check,
-                    onClick = viewModel::closeSheet,
-                    modifier = Modifier.weight(1f)
-                )
-            }
+            StudioPrimaryButton(
+                text = "Done",
+                icon = Icons.Default.Check,
+                onClick = viewModel::closeSheet,
+                modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)
+            )
         }
     }
 }
@@ -489,6 +658,44 @@ private fun FilterSheet(clip: TimelineClip?, project: Project, viewModel: Editor
                 onValueChange = viewModel::updateFilterIntensityOnSelected
             )
         }
+        // ---- .cube LUT import: the engine parsed 3D LUTs but nothing could reach it.
+        StudioCard(title = "Custom 3D LUT", badge = ".cube") {
+            val lutLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.OpenDocument()
+            ) { uri -> if (uri != null) viewModel.importCubeLutUriOnSelected(uri) }
+            clip.colorGrade.customCubeLutUri?.let { loaded ->
+                Text(
+                    "Loaded: ${loaded.substringAfterLast('/')}",
+                    fontSize = 9.sp,
+                    color = ZeroAccent,
+                    maxLines = 1
+                )
+            }
+            StudioPrimaryButton(
+                text = "Import .cube LUT",
+                icon = Icons.Default.Palette,
+                onClick = { lutLauncher.launch(arrayOf("*/*")) }
+            )
+        }
+        // ---- Copy / paste the whole look between clips.
+        StudioCard(title = "Copy look") {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                StudioAction(Icons.Default.ContentCopy, "Copy", onClick = viewModel::copySelectedClipAttributes)
+                StudioAction(
+                    Icons.Default.ContentPaste,
+                    "Paste",
+                    enabled = viewModel.hasCopiedAttributes,
+                    onClick = viewModel::pasteAttributesOnSelected
+                )
+                StudioAction(
+                    Icons.Default.SelectAll,
+                    "Paste all",
+                    enabled = viewModel.hasCopiedAttributes,
+                    onClick = viewModel::pasteAttributesToAllClips
+                )
+                StudioAction(Icons.Default.Layers, "Apply all", onClick = viewModel::applyColorGradeToAllClips)
+            }
+        }
     }
 }
 
@@ -738,9 +945,34 @@ private fun EffectsSheet(clip: TimelineClip?, project: Project, viewModel: Edito
 // ---------------------------------------------------------------------------- transitions
 
 @Composable
-private fun TransitionSheet(clip: TimelineClip?, viewModel: EditorViewModel) {
-    if (clip == null) { EmptySelectionHint(); return }
+private fun TransitionSheet(clip: TimelineClip?, project: Project, viewModel: EditorViewModel) {
+    var autoType by remember { mutableStateOf(TransitionType.DISSOLVE) }
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        // One-tap "make it look edited": drop the same transition on every cut at once.
+        StudioCard(title = "Auto transitions", badge = "${(project.mainVideoClips.size - 1).coerceAtLeast(0)} cuts") {
+            StudioChipRow {
+                TransitionType.entries.forEach { type ->
+                    StudioChip(label = type.label, selected = autoType == type) { autoType = type }
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                StudioPrimaryButton(
+                    text = "Apply to all cuts",
+                    icon = Icons.Default.AutoAwesomeMotion,
+                    onClick = { viewModel.applyTransitionToAllCuts(autoType) },
+                    modifier = Modifier.weight(1f)
+                )
+                StudioPrimaryButton(
+                    text = "Clear all",
+                    icon = Icons.Default.LayersClear,
+                    container = ZeroSurfaceHigh,
+                    contentColor = TextPrimary,
+                    onClick = viewModel::clearAllTransitions,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+        if (clip == null) { EmptySelectionHint(); return@Column }
         StudioChipRow {
             TransitionType.entries.forEach { type ->
                 StudioChip(
@@ -822,6 +1054,31 @@ private fun TextSheet(clip: TimelineClip?, project: Project, viewModel: EditorVi
                 icon = Icons.Default.TextFields,
                 onClick = { viewModel.addTextClip(TextStyleSpec(text = "Your text")) }
             )
+            Spacer(Modifier.height(6.dp))
+            Text("Templates", fontSize = 9.sp, color = TextTertiary)
+            StudioChipRow {
+                TEXT_TEMPLATES.forEach { (id, template) ->
+                    StudioChip(label = id, selected = spec?.templateId == template.templateId) {
+                        if (spec != null) viewModel.updateSelectedTextSpec(template.copy(text = spec.text))
+                        else viewModel.addTextClip(template)
+                    }
+                }
+            }
+        }
+
+        // ---- Stickers: addSticker() existed on the ViewModel with no way to call it.
+        StudioCard(title = "Stickers") {
+            STICKER_CATEGORIES.forEach { (category, emojis) ->
+                Text(category, fontSize = 9.sp, color = TextTertiary)
+                StudioChipRow {
+                    emojis.forEach { emoji ->
+                        StudioChip(label = emoji, selected = false) {
+                            viewModel.addSticker(StickerSpec(content = emoji, label = emoji, category = category))
+                        }
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+            }
         }
         if (spec != null && clip != null) {
             var text by remember(clip.id) { mutableStateOf(spec.text) }
@@ -867,11 +1124,51 @@ private fun TextSheet(clip: TimelineClip?, project: Project, viewModel: EditorVi
                     valueText = "${spec.shadowRadius.toInt()}",
                     onValueChange = { viewModel.updateSelectedTextSpec(spec.copy(shadowRadius = it)) }
                 )
+                StudioSlider(
+                    label = "Letter spacing",
+                    value = spec.letterSpacingEm,
+                    valueRange = -0.1f..0.5f,
+                    defaultValue = 0.02f,
+                    valueText = "%.2fem".format(spec.letterSpacingEm),
+                    onValueChange = { viewModel.updateSelectedTextSpec(spec.copy(letterSpacingEm = it)) }
+                )
+                Text("Animation", fontSize = 9.sp, color = TextTertiary)
                 StudioChipRow {
                     TextAnimationType.entries.forEach { anim ->
                         StudioChip(anim.label, spec.animationIn == anim) {
                             viewModel.updateSelectedTextSpec(spec.copy(animationIn = anim))
                         }
+                    }
+                }
+                Text("Font", fontSize = 9.sp, color = TextTertiary)
+                StudioChipRow {
+                    TEXT_FONTS.forEach { font ->
+                        StudioChip(font, spec.fontFamilyName == font) {
+                            viewModel.updateSelectedTextSpec(spec.copy(fontFamilyName = font))
+                        }
+                    }
+                }
+            }
+            StudioCard(title = "Colour") {
+                Text("Text", fontSize = 9.sp, color = TextTertiary)
+                ColorSwatchRow(selected = spec.textColorArgb) {
+                    viewModel.updateSelectedTextSpec(spec.copy(textColorArgb = it))
+                }
+                Text("Outline", fontSize = 9.sp, color = TextTertiary)
+                ColorSwatchRow(selected = spec.outlineColorArgb) {
+                    viewModel.updateSelectedTextSpec(spec.copy(outlineColorArgb = it))
+                }
+                Text("Background pill", fontSize = 9.sp, color = TextTertiary)
+                ColorSwatchRow(selected = spec.backgroundColorArgb, includeTransparent = true) {
+                    viewModel.updateSelectedTextSpec(spec.copy(backgroundColorArgb = it))
+                }
+                StudioToggleRow("Gradient fill", spec.useGradient) {
+                    viewModel.updateSelectedTextSpec(spec.copy(useGradient = it))
+                }
+                if (spec.useGradient) {
+                    Text("Gradient end", fontSize = 9.sp, color = TextTertiary)
+                    ColorSwatchRow(selected = spec.gradientEndColorArgb) {
+                        viewModel.updateSelectedTextSpec(spec.copy(gradientEndColorArgb = it))
                     }
                 }
             }
@@ -947,6 +1244,8 @@ private fun AudioSheet(
     clip: TimelineClip?,
     project: Project,
     playheadMs: Long,
+    recording: Boolean,
+    micLevel: Float,
     viewModel: EditorViewModel
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -958,8 +1257,74 @@ private fun AudioSheet(
                 StudioAction(Icons.Default.GraphicEq, "Detect beats", onClick = viewModel::detectBeatsAndAutoSync)
                 StudioAction(
                     Icons.Default.LibraryAdd,
-                    if (clip?.hasAudioTrack == true) "Extract audio" else "Extract",
+                    "Extract audio",
                     onClick = viewModel::extractAudioFromSelectedClip
+                )
+                StudioAction(
+                    Icons.Default.MusicNote,
+                    "Snap to beat",
+                    onClick = viewModel::snapCutsToBeats
+                )
+            }
+        }
+
+        // ---- Voiceover: the recorder existed in the ViewModel but had no UI at all.
+        StudioCard(title = "Voiceover", badge = if (recording) "REC" else null) {
+            StudioPrimaryButton(
+                text = if (recording) "Stop recording" else "Record at playhead",
+                icon = if (recording) Icons.Default.Stop else Icons.Default.Mic,
+                container = if (recording) ZeroCoral else ZeroAccent,
+                contentColor = ZeroBlack,
+                onClick = viewModel::toggleVoiceoverRecording
+            )
+            if (recording) {
+                // Live input meter so the user knows the mic is actually hearing them.
+                Spacer(Modifier.height(6.dp))
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(8.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(ZeroSurfaceHigh)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(micLevel.coerceIn(0f, 1f))
+                            .fillMaxHeight()
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(if (micLevel > 0.92f) ZeroCoral else ZeroAccent)
+                    )
+                }
+                Text(
+                    "Input ${(micLevel * 100).toInt()}%" + if (micLevel > 0.92f) " · clipping" else "",
+                    fontSize = 9.sp,
+                    color = if (micLevel > 0.92f) ZeroCoral else TextTertiary
+                )
+            }
+        }
+
+        // ---- 12 synthesized sound effects, previously unreachable from the UI.
+        StudioCard(title = "Sound effects", badge = "${BuiltInSfxPreset.entries.size}") {
+            StudioChipRow {
+                BuiltInSfxPreset.entries.forEach { sfx ->
+                    StudioChip(label = sfx.title, selected = false) { viewModel.addSynthesizedSfx(sfx) }
+                }
+            }
+        }
+
+        // ---- Auto-cut silence: removes dead air from the selected clip in one tap.
+        if (clip != null && clip.hasAudioTrack) {
+            StudioCard(title = "Auto-cut silence", badge = "AI") {
+                Text(
+                    "Scans the clip's loudness and removes every quiet gap longer than half a second.",
+                    fontSize = 9.sp,
+                    color = TextTertiary
+                )
+                Spacer(Modifier.height(5.dp))
+                StudioPrimaryButton(
+                    text = "Remove silent gaps",
+                    icon = Icons.Default.ContentCut,
+                    onClick = viewModel::autoCutSilenceOnSelected
                 )
             }
         }
@@ -1028,7 +1393,11 @@ private fun AudioSheet(
                         Text(track.type.label, fontSize = 11.sp, color = TextPrimary)
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             StudioChip("Mute", selected = track.isMuted) { viewModel.toggleTrackMute(track.id) }
-                            StudioChip("Solo", selected = false) { }
+                            // Solo used to be an empty lambda; it now really mutes every other
+                            // audio track and toggles back off when tapped again.
+                            StudioChip("Solo", selected = viewModel.isTrackSoloed(track.id)) {
+                                viewModel.toggleTrackSolo(track.id)
+                            }
                         }
                     }
                     StudioSlider(
@@ -1047,62 +1416,175 @@ private fun AudioSheet(
 
 // ---------------------------------------------------------------------------- keyframes
 
+/**
+ * Motion & keyframes.
+ *
+ * The old panel was decorative: "+ Key" always wrote `prop.defaultValue` (so every keyframe had
+ * the same value and nothing ever animated) and there was no way to change a value or its easing
+ * after the fact. This one seeds each key from the clip's **actual** value at the playhead and
+ * gives every key a live value slider plus an easing picker.
+ */
 @Composable
 private fun KeyframeSheet(clip: TimelineClip?, playheadMs: Long, viewModel: EditorViewModel) {
+    if (clip == null) { EmptySelectionHint(); return }
+    val localMs = (playheadMs - clip.startTimeOnTrackMs).coerceIn(0L, clip.timelineDurationMs)
+    val liveState = remember(clip, localMs) {
+        com.vibecut.pro.engine.keyframes.KeyframeInterpolator.evaluateClipState(clip, localMs)
+    }
+    var expandedId by remember(clip.id) { mutableStateOf<String?>(null) }
+
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        StudioCard(title = "Add keyframe") {
-            val local = clip?.let { (playheadMs - it.startTimeOnTrackMs).coerceAtLeast(0L) } ?: 0L
+        StudioCard(title = "Add keyframe at playhead", badge = "${localMs / 1000f}s") {
+            Text(
+                "Keys are captured from the clip's current value, so moving the playhead and " +
+                    "changing a value animates between them.",
+                fontSize = 9.sp,
+                color = TextTertiary
+            )
+            Spacer(Modifier.height(4.dp))
             KeyframeProperty.entries.forEach { prop ->
+                val current = currentValueFor(prop, liveState, clip)
+                val existing = clip.keyframes.firstOrNull {
+                    it.property == prop && kotlin.math.abs(it.timeOffsetMs - localMs) < 40L
+                }
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 1.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text(prop.label, fontSize = 11.sp, color = TextPrimary)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(prop.label, fontSize = 11.sp, color = TextPrimary)
+                        Text(
+                            "now ${formatKeyValue(current)}" +
+                                (if (existing != null) " · keyed" else ""),
+                            fontSize = 8.5.sp,
+                            color = if (existing != null) ZeroAmber else TextTertiary
+                        )
+                    }
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(8.dp))
-                            .background(ZeroAccent.copy(alpha = 0.14f))
-                            .clickable {
-                                viewModel.upsertKeyframeAtPlayhead(prop, prop.defaultValue)
-                            }
+                            .background(if (existing != null) ZeroAmber.copy(alpha = 0.18f) else ZeroAccent.copy(alpha = 0.14f))
+                            // Seeds the key with the live value instead of a hard-coded default.
+                            .clickable { viewModel.upsertKeyframeAtPlayhead(prop, current) }
                             .padding(horizontal = 10.dp, vertical = 6.dp)
                     ) {
-                        Text("+ Key", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = ZeroAccent)
-                    }
-                }
-            }
-        }
-        if (clip != null && clip.keyframes.isNotEmpty()) {
-            StudioCard(title = "On this clip", onReset = viewModel::clearKeyframesOnSelected) {
-                clip.keyframes.sortedBy { it.timeOffsetMs }.forEach { kf ->
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column {
-                            Text(kf.property.label, fontSize = 11.sp, color = TextPrimary)
-                            Text(
-                                "${kf.timeOffsetMs / 1000f}s · ${kf.value}",
-                                fontSize = 9.sp,
-                                color = TextTertiary
-                            )
-                        }
-                        Icon(
-                            Icons.Default.Close,
-                            contentDescription = "Delete keyframe",
-                            tint = ZeroCoral,
-                            modifier = Modifier
-                                .size(18.dp)
-                                .clickable { viewModel.removeKeyframe(kf.id) }
+                        Text(
+                            if (existing != null) "Update" else "+ Key",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (existing != null) ZeroAmber else ZeroAccent
                         )
                     }
                 }
             }
         }
+
+        if (clip.keyframes.isNotEmpty()) {
+            StudioCard(title = "Keys on this clip", badge = "${clip.keyframes.size}", onReset = viewModel::clearKeyframesOnSelected) {
+                clip.keyframes.sortedWith(compareBy({ it.property.ordinal }, { it.timeOffsetMs })).forEach { kf ->
+                    val expanded = expandedId == kf.id
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(9.dp))
+                            .background(if (expanded) ZeroSurfaceHigh else Color.Transparent)
+                            .padding(horizontal = 6.dp, vertical = 4.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { expandedId = if (expanded) null else kf.id },
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(kf.property.label, fontSize = 11.sp, color = TextPrimary)
+                                Text(
+                                    "${kf.timeOffsetMs / 1000f}s · ${formatKeyValue(kf.value)} · ${kf.easing.label}",
+                                    fontSize = 9.sp,
+                                    color = TextTertiary
+                                )
+                            }
+                            Icon(
+                                Icons.Default.PlayArrow,
+                                contentDescription = "Jump to keyframe",
+                                tint = ZeroAccent,
+                                modifier = Modifier
+                                    .size(17.dp)
+                                    .clickable { viewModel.seekTo(clip.startTimeOnTrackMs + kf.timeOffsetMs) }
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = "Delete keyframe",
+                                tint = ZeroCoral,
+                                modifier = Modifier
+                                    .size(17.dp)
+                                    .clickable { viewModel.removeKeyframe(kf.id) }
+                            )
+                        }
+                        if (expanded) {
+                            StudioSlider(
+                                label = "Value",
+                                value = kf.value.coerceIn(kf.property.minValue, kf.property.maxValue),
+                                valueRange = kf.property.minValue..kf.property.maxValue,
+                                defaultValue = kf.property.defaultValue,
+                                valueText = formatKeyValue(kf.value),
+                                onValueChange = { viewModel.updateKeyframeValue(kf.id, it) }
+                            )
+                            Text("Easing", fontSize = 9.sp, color = TextTertiary)
+                            StudioChipRow {
+                                EasingCurve.entries.forEach { curve ->
+                                    StudioChip(label = curve.label, selected = kf.easing == curve) {
+                                        viewModel.updateKeyframeEasing(kf.id, curve)
+                                    }
+                                }
+                            }
+                            StudioSlider(
+                                label = "Time",
+                                value = kf.timeOffsetMs.toFloat(),
+                                valueRange = 0f..clip.timelineDurationMs.toFloat().coerceAtLeast(1f),
+                                defaultValue = kf.timeOffsetMs.toFloat(),
+                                valueText = "${kf.timeOffsetMs / 1000f}s",
+                                onValueChange = { viewModel.moveKeyframeTime(kf.id, it.toLong()) }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        StudioCard(title = "Motion presets") {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                StudioAction(Icons.Default.ZoomOutMap, "Ken Burns", onClick = viewModel::applyKenBurnsPreset)
+                StudioAction(Icons.Default.Login, "Fade in", onClick = { viewModel.applyFadePreset(fadeIn = true) })
+                StudioAction(Icons.Default.Logout, "Fade out", onClick = { viewModel.applyFadePreset(fadeIn = false) })
+                StudioAction(Icons.Default.Animation, "Pop in", onClick = viewModel::applyPopInPreset)
+            }
+        }
     }
 }
+
+private fun currentValueFor(
+    prop: KeyframeProperty,
+    s: com.vibecut.pro.engine.keyframes.InterpolatedClipState,
+    clip: TimelineClip
+): Float = when (prop) {
+    KeyframeProperty.POSITION_X -> s.positionX
+    KeyframeProperty.POSITION_Y -> s.positionY
+    KeyframeProperty.SCALE -> kotlin.math.abs(s.scaleX)
+    KeyframeProperty.ROTATION -> s.rotationDegrees
+    KeyframeProperty.OPACITY -> s.opacity
+    KeyframeProperty.VOLUME -> if (clip.isMuted) 0f else clip.volume
+    KeyframeProperty.BLUR -> s.extraBlur
+    KeyframeProperty.EFFECT_INTENSITY -> s.effectIntensityMultiplier
+    KeyframeProperty.COLOR_INTENSITY -> s.colorIntensityMix
+    KeyframeProperty.TEXT_PROGRESS -> s.textProgress
+}.coerceIn(prop.minValue, prop.maxValue)
+
+private fun formatKeyValue(v: Float): String =
+    if (kotlin.math.abs(v) >= 10f) v.toInt().toString() else "%.2f".format(v)
 
 // ---------------------------------------------------------------------------- enhancement
 
@@ -1352,5 +1834,100 @@ private fun EmptySelectionHint() {
             fontSize = 11.sp,
             color = TextTertiary
         )
+    }
+}
+
+// ---------------------------------------------------------------------------- text assets
+
+/** Ready-made text looks, so "Text" is not just a blank white string. */
+internal val TEXT_TEMPLATES: List<Pair<String, TextStyleSpec>> = listOf(
+    "Clean" to TextStyleSpec(
+        templateId = "clean", text = "Your text", fontFamilyName = "Sans Bold",
+        fontSizeSp = 32f, textColorArgb = 0xFFFFFFFF, shadowRadius = 6f
+    ),
+    "Bold Pop" to TextStyleSpec(
+        templateId = "bold_pop", text = "YOUR TEXT", fontFamilyName = "Sans Black",
+        fontSizeSp = 44f, textColorArgb = 0xFFFFFFFF, outlineWidth = 4f,
+        outlineColorArgb = 0xFF000000, letterSpacingEm = 0.04f,
+        animationIn = TextAnimationType.POP_BOUNCE
+    ),
+    "Caption Pill" to TextStyleSpec(
+        templateId = "caption_pill", text = "Your caption", fontFamilyName = "Sans Medium",
+        fontSizeSp = 26f, textColorArgb = 0xFF101316, backgroundColorArgb = 0xF2FFFFFF,
+        shadowRadius = 0f
+    ),
+    "Neon" to TextStyleSpec(
+        templateId = "neon", text = "NEON", fontFamilyName = "Sans Black",
+        fontSizeSp = 40f, textColorArgb = 0xFF6EF2B5, useGradient = true,
+        gradientEndColorArgb = 0xFF9B8CFF, shadowRadius = 18f, shadowColorArgb = 0xCC6EF2B5
+    ),
+    "Subtitle" to TextStyleSpec(
+        templateId = "subtitle", text = "Subtitle line", fontFamilyName = "Sans Medium",
+        fontSizeSp = 22f, textColorArgb = 0xFFFFFFFF, outlineWidth = 2f,
+        outlineColorArgb = 0xCC000000, animationIn = TextAnimationType.NONE
+    ),
+    "Cinematic" to TextStyleSpec(
+        templateId = "cinematic", text = "CINEMATIC", fontFamilyName = "Serif Bold",
+        fontSizeSp = 30f, textColorArgb = 0xFFF5E9D0, letterSpacingEm = 0.22f,
+        shadowRadius = 10f, animationIn = TextAnimationType.FADE_UP
+    )
+)
+
+internal val TEXT_FONTS = listOf("Sans Bold", "Sans Black", "Sans Medium", "Serif Bold", "Monospace")
+
+internal val STICKER_CATEGORIES: List<Pair<String, List<String>>> = listOf(
+    "Trending" to listOf("🔥", "✨", "💯", "👀", "🎯", "⚡", "🚀", "💥"),
+    "Reactions" to listOf("😂", "😍", "😮", "😎", "🤯", "🥹", "👏", "🙌"),
+    "Arrows" to listOf("👉", "👈", "⬆️", "⬇️", "➡️", "⬅️", "🔁", "↩️"),
+    "Vlog" to listOf("📍", "⭐", "❤️", "🎵", "📸", "🏆", "☕", "🌙")
+)
+
+internal val TEXT_SWATCHES: List<Long> = listOf(
+    0xFFFFFFFF, 0xFF101316, 0xFF6EF2B5, 0xFF9B8CFF, 0xFFFFC46B,
+    0xFFFF7A7A, 0xFF64B5F6, 0xFFFF4FD8, 0xFF00E5FF, 0xFFB7F25B
+)
+
+/** Compact colour picker used by the text panel. */
+@Composable
+internal fun ColorSwatchRow(
+    selected: Long,
+    includeTransparent: Boolean = false,
+    onPick: (Long) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        if (includeTransparent) {
+            Box(
+                modifier = Modifier
+                    .size(26.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(ZeroSurfaceHigh)
+                    .border(
+                        width = if (selected == 0x00000000L) 2.dp else 1.dp,
+                        color = if (selected == 0x00000000L) ZeroAccent else ZeroStroke,
+                        shape = RoundedCornerShape(8.dp)
+                    )
+                    .clickable { onPick(0x00000000L) },
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(Icons.Default.FormatColorReset, null, tint = TextTertiary, modifier = Modifier.size(14.dp))
+            }
+        }
+        TEXT_SWATCHES.forEach { argb ->
+            Box(
+                modifier = Modifier
+                    .size(26.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(argb))
+                    .border(
+                        width = if (selected == argb) 2.dp else 1.dp,
+                        color = if (selected == argb) ZeroAccent else ZeroStroke,
+                        shape = RoundedCornerShape(8.dp)
+                    )
+                    .clickable { onPick(argb) }
+            )
+        }
     }
 }
