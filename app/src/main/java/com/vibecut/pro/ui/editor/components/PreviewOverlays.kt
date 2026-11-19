@@ -12,14 +12,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.min
+import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.vibecut.pro.engine.keyframes.KeyframeInterpolator
@@ -132,9 +138,31 @@ fun PreviewOverlays(
             val localMs = (playheadMs - textClip.startTimeOnTrackMs).coerceAtLeast(0L)
             val state = KeyframeInterpolator.evaluateClipState(textClip, localMs)
             val animProgress = animationProgress(spec, localMs)
+            // Same placement formula as the export renderer: centre ± pos * 0.45. The preview
+            // used to subtract a further 0.28 of the stage height here, so text sat visibly
+            // higher on screen than in the file the user actually got.
             val offsetX = stageW * (state.positionX * 0.45f)
-            val offsetY = stageH * (-state.positionY * 0.45f - 0.28f)
+            val offsetY = stageH * (-state.positionY * 0.45f)
             val isSelected = selectedClipId == textClip.id
+
+            // The exporter scales the point size by (shortSide / 360), so the preview must do
+            // the same against its own stage or the text is the wrong size relative to the frame.
+            val fontScale = min(stageW, stageH).value / 360f
+            val visible = animProgress.visibleText(spec.text)
+            val textStyle = TextStyle(
+                fontSize = (spec.fontSizeSp * fontScale).sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = spec.composeFontFamily(),
+                letterSpacing = spec.letterSpacingEm.em,
+                textAlign = TextAlign.Center,
+                shadow = if (spec.shadowRadius > 0.2f) {
+                    androidx.compose.ui.graphics.Shadow(
+                        color = Color(spec.shadowColorArgb.toInt()),
+                        blurRadius = spec.shadowRadius * 1.8f,
+                        offset = Offset(0f, 3f)
+                    )
+                } else null
+            )
 
             Box(
                 modifier = Modifier
@@ -164,23 +192,46 @@ fun PreviewOverlays(
                                 }
                         } else Modifier
                     )
-                    .padding(6.dp)
-            ) {
-                Text(
-                    text = animProgress.visibleText(spec.text),
-                    color = Color(spec.textColorArgb.toInt()),
-                    fontSize = spec.fontSizeSp.sp,
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center,
-                    style = androidx.compose.ui.text.TextStyle(
-                        shadow = androidx.compose.ui.graphics.Shadow(
-                            color = Color(spec.shadowColorArgb.toInt()),
-                            blurRadius = spec.shadowRadius,
-                            offset = Offset(0f, 2f)
-                        ),
-                        letterSpacing = spec.letterSpacingEm.sp
+                    // Background pill — exported but previously invisible while editing.
+                    .then(
+                        if ((spec.backgroundColorArgb ushr 24) > 0L) {
+                            Modifier
+                                .clip(RoundedCornerShape(18.dp))
+                                .background(Color(spec.backgroundColorArgb.toInt()))
+                        } else Modifier
                     )
-                )
+                    .padding(horizontal = 14.dp, vertical = 6.dp)
+            ) {
+                // Outline is stroked underneath the fill, matching the export's two-pass draw.
+                if (spec.outlineWidth > 0.2f) {
+                    Text(
+                        text = visible,
+                        color = Color(spec.outlineColorArgb.toInt()),
+                        style = textStyle.copy(
+                            drawStyle = Stroke(width = spec.outlineWidth * 2.5f),
+                            shadow = null
+                        )
+                    )
+                }
+                if (spec.useGradient) {
+                    Text(
+                        text = visible,
+                        style = textStyle.copy(
+                            brush = Brush.linearGradient(
+                                listOf(
+                                    Color(spec.textColorArgb.toInt()),
+                                    Color(spec.gradientEndColorArgb.toInt())
+                                )
+                            )
+                        )
+                    )
+                } else {
+                    Text(
+                        text = visible,
+                        color = Color(spec.textColorArgb.toInt()),
+                        style = textStyle
+                    )
+                }
             }
         }
 
@@ -193,9 +244,11 @@ fun PreviewOverlays(
             Box(
                 modifier = Modifier
                     .align(Alignment.Center)
+                    // Matches the export renderer exactly. The extra +0.28 / +0.30 that used to
+                    // be here pushed every sticker down and to the right of where it exported.
                     .offset(
-                        x = stageW * (state.positionX * 0.45f + 0.28f),
-                        y = stageH * (-state.positionY * 0.45f + 0.3f)
+                        x = stageW * (state.positionX * 0.45f),
+                        y = stageH * (-state.positionY * 0.45f)
                     )
                     .graphicsLayer(
                         scaleX = state.scaleX,
@@ -222,7 +275,8 @@ fun PreviewOverlays(
                     )
                     .padding(4.dp)
             ) {
-                Text(spec.content, fontSize = 34.sp)
+                // Export draws stickers at 110px on a 1080px short side; mirror that ratio.
+                Text(spec.content, fontSize = (min(stageW, stageH).value * 110f / 1080f).sp)
             }
         }
 
@@ -277,4 +331,14 @@ private fun animationProgress(spec: TextStyleSpec, localMs: Long): AnimFrame {
         TextAnimationType.SLIDE_IN -> AnimFrame(alpha = t, slideDp = -(1f - t) * 26f)
         TextAnimationType.KARAOKE -> AnimFrame(visibleChars = (spec.text.length * t).toInt())
     }
+}
+
+/**
+ * Mirrors the typeface selection in `VibeCutSceneOverlay.drawStyledText` so the font the user
+ * picks is the font they see while editing, not just the one that lands in the export.
+ */
+private fun TextStyleSpec.composeFontFamily(): FontFamily = when {
+    fontFamilyName.contains("Serif", true) && !fontFamilyName.contains("Sans", true) -> FontFamily.Serif
+    fontFamilyName.contains("Mono", true) -> FontFamily.Monospace
+    else -> FontFamily.SansSerif
 }

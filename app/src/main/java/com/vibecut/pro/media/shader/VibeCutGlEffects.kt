@@ -2,6 +2,7 @@ package com.vibecut.pro.media.shader
 
 import android.content.Context
 import android.graphics.*
+import com.vibecut.pro.engine.model.BlendMode as EngineBlendMode
 import android.net.Uri
 import android.opengl.GLES20
 import android.opengl.GLUtils
@@ -782,7 +783,7 @@ class VibeCutSceneOverlay(
      * devices fall back to the Porter-Duff subset and composite normally for modes that cannot
      * be expressed, rather than drawing something wrong.
      */
-    private fun applyBlendMode(paint: Paint, mode: BlendMode) {
+    private fun applyBlendMode(paint: Paint, mode: EngineBlendMode) {
         if (mode.isNormal) {
             paint.xfermode = null
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
@@ -792,33 +793,33 @@ class VibeCutSceneOverlay(
         }
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
             paint.blendMode = when (mode) {
-                BlendMode.SCREEN -> android.graphics.BlendMode.SCREEN
-                BlendMode.MULTIPLY -> android.graphics.BlendMode.MULTIPLY
-                BlendMode.OVERLAY -> android.graphics.BlendMode.OVERLAY
-                BlendMode.ADD -> android.graphics.BlendMode.PLUS
-                BlendMode.DARKEN -> android.graphics.BlendMode.DARKEN
-                BlendMode.LIGHTEN -> android.graphics.BlendMode.LIGHTEN
-                BlendMode.SOFT_LIGHT -> android.graphics.BlendMode.SOFT_LIGHT
-                BlendMode.HARD_LIGHT -> android.graphics.BlendMode.HARD_LIGHT
-                BlendMode.DIFFERENCE -> android.graphics.BlendMode.DIFFERENCE
-                BlendMode.COLOR_DODGE -> android.graphics.BlendMode.COLOR_DODGE
-                BlendMode.COLOR_BURN -> android.graphics.BlendMode.COLOR_BURN
-                BlendMode.EXCLUSION -> android.graphics.BlendMode.EXCLUSION
-                BlendMode.SUBTRACT -> android.graphics.BlendMode.DIFFERENCE
-                BlendMode.HUE -> android.graphics.BlendMode.HUE
-                BlendMode.COLOR -> android.graphics.BlendMode.COLOR
-                BlendMode.LUMINOSITY -> android.graphics.BlendMode.LUMINOSITY
-                BlendMode.NORMAL -> android.graphics.BlendMode.SRC_OVER
+                EngineBlendMode.SCREEN -> android.graphics.BlendMode.SCREEN
+                EngineBlendMode.MULTIPLY -> android.graphics.BlendMode.MULTIPLY
+                EngineBlendMode.OVERLAY -> android.graphics.BlendMode.OVERLAY
+                EngineBlendMode.ADD -> android.graphics.BlendMode.PLUS
+                EngineBlendMode.DARKEN -> android.graphics.BlendMode.DARKEN
+                EngineBlendMode.LIGHTEN -> android.graphics.BlendMode.LIGHTEN
+                EngineBlendMode.SOFT_LIGHT -> android.graphics.BlendMode.SOFT_LIGHT
+                EngineBlendMode.HARD_LIGHT -> android.graphics.BlendMode.HARD_LIGHT
+                EngineBlendMode.DIFFERENCE -> android.graphics.BlendMode.DIFFERENCE
+                EngineBlendMode.COLOR_DODGE -> android.graphics.BlendMode.COLOR_DODGE
+                EngineBlendMode.COLOR_BURN -> android.graphics.BlendMode.COLOR_BURN
+                EngineBlendMode.EXCLUSION -> android.graphics.BlendMode.EXCLUSION
+                EngineBlendMode.SUBTRACT -> android.graphics.BlendMode.DIFFERENCE
+                EngineBlendMode.HUE -> android.graphics.BlendMode.HUE
+                EngineBlendMode.COLOR -> android.graphics.BlendMode.COLOR
+                EngineBlendMode.LUMINOSITY -> android.graphics.BlendMode.LUMINOSITY
+                EngineBlendMode.NORMAL -> android.graphics.BlendMode.SRC_OVER
             }
             return
         }
         val legacy = when (mode) {
-            BlendMode.SCREEN -> PorterDuff.Mode.SCREEN
-            BlendMode.MULTIPLY -> PorterDuff.Mode.MULTIPLY
-            BlendMode.OVERLAY -> PorterDuff.Mode.OVERLAY
-            BlendMode.ADD -> PorterDuff.Mode.ADD
-            BlendMode.DARKEN -> PorterDuff.Mode.DARKEN
-            BlendMode.LIGHTEN -> PorterDuff.Mode.LIGHTEN
+            EngineBlendMode.SCREEN -> PorterDuff.Mode.SCREEN
+            EngineBlendMode.MULTIPLY -> PorterDuff.Mode.MULTIPLY
+            EngineBlendMode.OVERLAY -> PorterDuff.Mode.OVERLAY
+            EngineBlendMode.ADD -> PorterDuff.Mode.ADD
+            EngineBlendMode.DARKEN -> PorterDuff.Mode.DARKEN
+            EngineBlendMode.LIGHTEN -> PorterDuff.Mode.LIGHTEN
             else -> null
         }
         paint.xfermode = legacy?.let { android.graphics.PorterDuffXfermode(it) }
