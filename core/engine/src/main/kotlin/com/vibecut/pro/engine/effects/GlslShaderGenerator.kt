@@ -49,6 +49,58 @@ object GlslShaderGenerator {
             float e = 1.0e-10;
             return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
         }
+        vec3 hsv2rgb(vec3 c) {
+            vec3 p = abs(fract(c.xxx + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+            return c.z * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), c.y);
+        }
+        /**
+         * Real separable blend modes. `b` is the backdrop (layer below), `s` the source (this
+         * layer). Codes match BlendMode.glCode: 1 screen, 2 multiply, 3 overlay, 4 add,
+         * 5 darken, 6 lighten, 7 soft light, 8 hard light, 9 difference, 10 colour dodge,
+         * 11 colour burn, 12 exclusion, 13 subtract, 14 hue, 15 colour, 16 luminosity.
+         */
+        vec3 blendRgb(int mode, vec3 b, vec3 s) {
+            if (mode == 1) {                      // SCREEN
+                return 1.0 - (1.0 - b) * (1.0 - s);
+            } else if (mode == 2) {               // MULTIPLY
+                return b * s;
+            } else if (mode == 3) {               // OVERLAY (hard light with operands swapped)
+                return mix(2.0 * b * s, 1.0 - 2.0 * (1.0 - b) * (1.0 - s), step(0.5, b));
+            } else if (mode == 4) {               // ADD / linear dodge
+                return min(b + s, vec3(1.0));
+            } else if (mode == 5) {               // DARKEN
+                return min(b, s);
+            } else if (mode == 6) {               // LIGHTEN
+                return max(b, s);
+            } else if (mode == 7) {               // SOFT LIGHT (W3C formula)
+                vec3 d = mix(sqrt(b), ((16.0 * b - 12.0) * b + 4.0) * b, step(b, vec3(0.25)));
+                return mix(b - (1.0 - 2.0 * s) * b * (1.0 - b),
+                           b + (2.0 * s - 1.0) * (d - b),
+                           step(0.5, s));
+            } else if (mode == 8) {               // HARD LIGHT
+                return mix(2.0 * b * s, 1.0 - 2.0 * (1.0 - b) * (1.0 - s), step(0.5, s));
+            } else if (mode == 9) {               // DIFFERENCE
+                return abs(b - s);
+            } else if (mode == 10) {              // COLOR DODGE
+                return clamp(b / max(1.0 - s, 0.0039), 0.0, 1.0);
+            } else if (mode == 11) {              // COLOR BURN
+                return 1.0 - clamp((1.0 - b) / max(s, 0.0039), 0.0, 1.0);
+            } else if (mode == 12) {              // EXCLUSION
+                return b + s - 2.0 * b * s;
+            } else if (mode == 13) {              // SUBTRACT
+                return max(b - s, vec3(0.0));
+            } else if (mode == 14) {              // HUE
+                vec3 hb = rgb2hsv(b); vec3 hs = rgb2hsv(s);
+                return hsv2rgb(vec3(hs.x, hb.y, hb.z));
+            } else if (mode == 15) {              // COLOR
+                vec3 hb = rgb2hsv(b); vec3 hs = rgb2hsv(s);
+                return hsv2rgb(vec3(hs.x, hs.y, hb.z));
+            } else if (mode == 16) {              // LUMINOSITY
+                vec3 hb = rgb2hsv(b);
+                return hsv2rgb(vec3(hb.x, hb.y, luma(s)));
+            }
+            return s;                             // NORMAL
+        }
     """
 
     /** Returns a complete fragment shader for a single [EffectType] pass. */
@@ -531,6 +583,8 @@ object GlslShaderGenerator {
         uniform float uChromaAmount;
         uniform float uChromaSpill;
         uniform int uBlendMode;
+        uniform sampler2D uBackdropSampler;
+        uniform float uHasBackdrop;
         uniform int uTransitionType;
         uniform float uTransitionProgress;
         uniform float uTransitionSoftness;
@@ -717,19 +771,19 @@ object GlslShaderGenerator {
                 }
             }
 
-            // Blend mode compositing against the track below.
-            if (uBlendMode == 1) {
-                col.rgb = 1.0 - (1.0 - col.rgb) * (1.0 - col.rgb);
-            } else if (uBlendMode == 2) {
-                col.rgb = col.rgb * col.rgb;
-            } else if (uBlendMode == 3) {
-                col.rgb = clamp(2.0 * col.rgb * col.rgb * (1.0 - col.rgb) + col.rgb * col.rgb, 0.0, 1.0);
-            } else if (uBlendMode == 4) {
-                col.rgb = clamp(col.rgb * 1.6, 0.0, 1.0);
-            } else if (uBlendMode == 5) {
-                col.rgb = col.rgb * col.rgb;
-            } else if (uBlendMode == 6) {
-                col.rgb = clamp(sqrt(col.rgb), 0.0, 1.0);
+            // ---- Blend-mode compositing against the track below ----------------------------
+            // When a backdrop texture is bound (overlay/PiP passes) we run the real separable
+            // Porter-Duff + blend math. Otherwise the pass is the bottom layer and the mode is a
+            // no-op, which is correct: blending a layer with itself is not a blend mode.
+            if (uBlendMode != 0 && uHasBackdrop > 0.5) {
+                vec4 dst = texture2D(uBackdropSampler, clamp(uv, 0.0, 1.0));
+                vec3 blended = blendRgb(uBlendMode, dst.rgb, col.rgb);
+                float sa = clamp(col.a * uOpacity, 0.0, 1.0);
+                // Porter-Duff source-over using the mode-blended colour.
+                vec3 outRgb = mix(dst.rgb, blended, sa);
+                float outA = sa + dst.a * (1.0 - sa);
+                gl_FragColor = vec4(outRgb, outA);
+                return;
             }
 
             gl_FragColor = vec4(col.rgb * uOpacity, col.a * uOpacity);

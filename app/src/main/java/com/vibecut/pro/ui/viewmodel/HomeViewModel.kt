@@ -51,6 +51,16 @@ class HomeViewModel @Inject constructor(
     val preferences: StateFlow<StudioPreferences> = preferencesRepository.preferencesFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), StudioPreferences())
 
+    /**
+     * Null until DataStore has produced its first value.
+     *
+     * [preferences] starts at `StudioPreferences()` whose `onboardingCompleted` is `false`, so
+     * navigating off it meant every cold start flashed (or got stuck on) the onboarding screen
+     * for users who had already finished it. The splash screen waits on this instead.
+     */
+    val resolvedPreferences: StateFlow<StudioPreferences?> = preferencesRepository.preferencesFlow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
     private val _galleryItems = MutableStateFlow<List<DeviceGalleryItem>>(emptyList())
     val galleryItems: StateFlow<List<DeviceGalleryItem>> = _galleryItems.asStateFlow()
 

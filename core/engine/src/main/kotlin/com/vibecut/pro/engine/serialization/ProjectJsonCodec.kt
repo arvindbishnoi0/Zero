@@ -142,6 +142,7 @@ object ProjectJsonCodec {
         },
         "colorGrade" to encodeColorGrade(c.colorGrade),
         "transitionIn" to c.transitionIn?.let { encodeTransition(it) },
+        "transitionOut" to c.transitionOut?.let { encodeTransition(it) },
         "keyframes" to c.keyframes.map { kf ->
             linkedMapOf(
                 "id" to kf.id,
@@ -244,6 +245,7 @@ object ProjectJsonCodec {
             },
             colorGrade = o.objOrNull("colorGrade")?.let { decodeColorGrade(it) } ?: ColorGradeConfig(),
             transitionIn = o.objOrNull("transitionIn")?.let { decodeTransition(it) },
+            transitionOut = o.objOrNull("transitionOut")?.let { decodeTransition(it) },
             keyframes = o.list("keyframes").mapNotNull { raw ->
                 val k = raw.asObj()
                 val prop = runCatching { KeyframeProperty.valueOf(k.str("prop", "OPACITY")) }.getOrNull()
@@ -444,7 +446,8 @@ object ProjectJsonCodec {
         "spacing" to t.letterSpacingEm,
         "anim" to t.animationIn.name,
         "animDur" to t.animationDurationMs,
-        "lang" to t.languageTag
+        "lang" to t.languageTag,
+        "template" to t.templateId
     )
 
     private fun decodeTextSpec(o: JsonObj): TextStyleSpec = TextStyleSpec(
@@ -463,7 +466,8 @@ object ProjectJsonCodec {
         animationIn = runCatching { TextAnimationType.valueOf(o.str("anim", "FADE_UP")) }
             .getOrDefault(TextAnimationType.FADE_UP),
         animationDurationMs = o.long("animDur", 450L),
-        languageTag = o.str("lang", "en-US")
+        languageTag = o.str("lang", "en-US"),
+        templateId = o.strOrNull("template")
     )
 
     private fun encodeSubtitle(s: SubtitleCue): Map<String, Any?> = linkedMapOf(

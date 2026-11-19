@@ -13,6 +13,7 @@ import com.vibecut.pro.engine.timeline.ExportSegmentPlanner
 import com.vibecut.pro.engine.timeline.ImportedMediaSource
 import com.vibecut.pro.engine.timeline.TimelineEngine
 import com.vibecut.pro.engine.timeline.TimelineSessionManager
+import com.vibecut.pro.engine.timeline.TimelineViewportMath
 import org.junit.Assert.*
 import org.junit.Test
 import kotlin.math.abs
@@ -653,4 +654,149 @@ class VibeCutEngineTest {
         // Unknown ids fall back to the default ratio instead of crashing a saved project.
         assertEquals(AspectRatioPreset.REELS_9_16, AspectRatioPreset.fromId("nonsense"))
     }
+    // ---------------------------------------------------------------- 13. timeline viewport maths
+
+    /**
+     * The timeline used to hit-test in pixels while sizing content in dp, so on a 3x-density
+     * phone every clip was drawn at a third of its real width and taps landed on the wrong clip.
+     * These lock the px contract down on the JVM.
+     */
+    @Test
+    fun test13_viewportPixelMathRoundTripsAndClamps() {
+        // 100 px/s means 100 px == 1000 ms, both ways.
+        assertEquals(1_000L, TimelineViewportMath.pxToMs(100f, 100f))
+        assertEquals(100f, TimelineViewportMath.msToPx(1_000L, 100f), 0.01f)
+
+        // Round-trip across a wide zoom range stays within a millisecond.
+        listOf(8f, 23f, 60f, 100f, 377f, 640f).forEach { zoom ->
+            listOf(0L, 1L, 333L, 5_000L, 123_456L).forEach { ms ->
+                val back = TimelineViewportMath.pxToMs(TimelineViewportMath.msToPx(ms, zoom), zoom)
+                assertTrue("round trip $ms @ $zoom gave $back", abs(back - ms) <= 1L)
+            }
+        }
+
+        // Zoom is always clamped, including against garbage input.
+        assertEquals(TimelineViewportMath.MIN_PX_PER_SEC, TimelineViewportMath.clampZoom(0.0001f), 0.001f)
+        assertEquals(TimelineViewportMath.MAX_PX_PER_SEC, TimelineViewportMath.clampZoom(99_999f), 0.001f)
+        assertEquals(TimelineViewportMath.MIN_PX_PER_SEC, TimelineViewportMath.clampZoom(Float.NaN), 0.001f)
+        assertEquals(0L, TimelineViewportMath.pxToMs(Float.NaN, 100f))
+
+        // Drag deltas must stay signed — clamping these at zero froze leftward drags.
+        assertEquals(-500L, TimelineViewportMath.pxDeltaToMs(-50f, 100f))
+        assertEquals(500L, TimelineViewportMath.pxDeltaToMs(50f, 100f))
+        assertTrue(TimelineViewportMath.pxToMs(-50f, 100f) == 0L)
+
+        // maxScroll is finite and never negative (it used to be Float.MAX_VALUE).
+        val maxScroll = TimelineViewportMath.maxScrollPx(10_000L, 100f, 1080f)
+        assertTrue("maxScroll must be finite, got $maxScroll", maxScroll.isFinite())
+        assertEquals(1_200f - 1_080f, maxScroll, 0.01f)
+        assertEquals(0f, TimelineViewportMath.maxScrollPx(500L, 8f, 1080f), 0.01f)
+    }
+
+    @Test
+    fun test13b_pinchZoomKeepsTheFrameUnderTheFingers() {
+        val durationMs = 60_000L
+        val viewport = 1080f
+        var zoom = 100f
+        var scroll = 500f
+        val centroid = 400f
+        val focusBefore = TimelineViewportMath.pxToMs(scroll + centroid, zoom)
+
+        listOf(2f, 0.5f, 1.7f, 0.3f).forEach { factor ->
+            val (nz, ns) = TimelineViewportMath.pinchZoom(zoom, scroll, centroid, factor, durationMs, viewport)
+            zoom = nz
+            scroll = ns
+            assertTrue(zoom in TimelineViewportMath.MIN_PX_PER_SEC..TimelineViewportMath.MAX_PX_PER_SEC)
+            assertTrue("scroll must stay in range, got $scroll", scroll >= 0f)
+            assertTrue(scroll <= TimelineViewportMath.maxScrollPx(durationMs, zoom, viewport) + 0.5f)
+        }
+        // After zooming in and back out the focus point is still roughly under the fingers.
+        val focusAfter = TimelineViewportMath.pxToMs(scroll + centroid, zoom)
+        assertTrue("focus drifted from $focusBefore to $focusAfter", abs(focusAfter - focusBefore) < 1_500L)
+
+        // Fit-to-width actually fits, and stays clamped.
+        val fit = TimelineViewportMath.fitZoom(durationMs, viewport)
+        assertTrue(fit in TimelineViewportMath.MIN_PX_PER_SEC..TimelineViewportMath.MAX_PX_PER_SEC)
+        assertTrue(
+            "fit zoom must not overflow the viewport",
+            TimelineViewportMath.contentWidthPx(durationMs, fit) <= viewport * 1.35f
+        )
+    }
+
+    @Test
+    fun test13c_dragClassificationAndLivePreviewGeometry() {
+        // An unselected clip is always a move target — trim handles only appear once selected.
+        assertEquals(
+            TimelineViewportMath.DragMode.MOVE,
+            TimelineViewportMath.classifyTouch(2f, 300f, 48f, selected = false)
+        )
+        assertEquals(
+            TimelineViewportMath.DragMode.TRIM_START,
+            TimelineViewportMath.classifyTouch(10f, 300f, 48f, selected = true)
+        )
+        assertEquals(
+            TimelineViewportMath.DragMode.TRIM_END,
+            TimelineViewportMath.classifyTouch(295f, 300f, 48f, selected = true)
+        )
+        assertEquals(
+            TimelineViewportMath.DragMode.MOVE,
+            TimelineViewportMath.classifyTouch(150f, 300f, 48f, selected = true)
+        )
+        // A very narrow clip still leaves a middle band to grab for moving.
+        assertEquals(
+            TimelineViewportMath.DragMode.MOVE,
+            TimelineViewportMath.classifyTouch(30f, 60f, 48f, selected = true)
+        )
+
+        // Trimming the head moves start and duration in opposite directions by the same amount.
+        val (s1, d1) = TimelineViewportMath.previewGeometry(
+            TimelineViewportMath.DragMode.TRIM_START,
+            originalStartMs = 5_000L, originalDurationMs = 4_000L, deltaMs = 1_000L,
+            minDurationMs = 200L, maxExtendStartMs = 2_000L, maxExtendEndMs = 2_000L
+        )
+        assertEquals(6_000L, s1)
+        assertEquals(3_000L, d1)
+
+        // Nothing can be trimmed below the minimum duration, or dragged before zero.
+        val (_, d2) = TimelineViewportMath.previewGeometry(
+            TimelineViewportMath.DragMode.TRIM_END,
+            originalStartMs = 0L, originalDurationMs = 1_000L, deltaMs = -999_999L,
+            minDurationMs = 200L, maxExtendStartMs = 0L, maxExtendEndMs = 0L
+        )
+        assertEquals(200L, d2)
+        val (s3, d3) = TimelineViewportMath.previewGeometry(
+            TimelineViewportMath.DragMode.MOVE,
+            originalStartMs = 1_000L, originalDurationMs = 2_000L, deltaMs = -999_999L,
+            minDurationMs = 200L, maxExtendStartMs = 0L, maxExtendEndMs = 0L
+        )
+        assertEquals(0L, s3)
+        assertEquals(2_000L, d3)
+    }
+
+    @Test
+    fun test13d_playheadFollowingHasADeadZone() {
+        val duration = 120_000L
+        val viewport = 1080f
+        val zoom = 100f
+        // Playhead comfortably inside the visible band (x = 800px, band = 530..1242 px):
+        // no scrolling, so the timeline is steady instead of jittering every frame.
+        assertNull(TimelineViewportMath.followPlayheadScroll(8_000L, zoom, 400f, viewport, duration))
+        // Just outside the band on the left, it does scroll.
+        assertTrue(TimelineViewportMath.followPlayheadScroll(4_000L, zoom, 400f, viewport, duration) != null)
+        // Playhead off the right edge: scroll so it lands back inside the band.
+        val target = TimelineViewportMath.followPlayheadScroll(30_000L, zoom, 400f, viewport, duration)
+        assertTrue("expected a scroll", target != null)
+        val x = TimelineViewportMath.msToPx(30_000L, zoom)
+        assertTrue(x >= target!! && x <= target + viewport)
+        // Ruler ticks get coarser as you zoom out, never zero or negative.
+        var previous = 0f
+        listOf(640f, 320f, 180f, 96f, 48f, 24f, 12f, 8f).forEach { z ->
+            val step = TimelineViewportMath.tickStepSeconds(z)
+            assertTrue("step must be positive at $z", step > 0f)
+            assertTrue("step must grow as zoom shrinks (at $z)", step >= previous)
+            previous = step
+            assertTrue(TimelineViewportMath.majorTickEvery(step) >= 2)
+        }
+    }
+
 }

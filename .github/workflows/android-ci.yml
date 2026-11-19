@@ -75,6 +75,19 @@ jobs:
             exit $STATUS
           fi
 
+      - name: Unit tests (app)
+        run: |
+          set +e
+          ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon > /tmp/gradle-apptest.log 2>&1
+          STATUS=$?
+          cat /tmp/gradle-apptest.log
+          if [ $STATUS -ne 0 ]; then
+            grep -E "^e: |FAILED|FAILURE:|What went wrong:|^\* |^  > |error: |Execution failed" /tmp/gradle-apptest.log | head -n 80 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit $STATUS
+          fi
+
       - name: Assemble debug APK
         run: |
           set +e

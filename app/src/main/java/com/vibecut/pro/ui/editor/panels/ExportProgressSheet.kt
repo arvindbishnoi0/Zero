@@ -20,7 +20,6 @@ import com.vibecut.pro.engine.model.Project
 import com.vibecut.pro.media.export.ExportProgressState
 import com.vibecut.pro.ui.theme.*
 import com.vibecut.pro.ui.viewmodel.EditorViewModel
-import java.io.File
 import java.util.Locale
 
 /**
@@ -78,20 +77,31 @@ fun ExportProgressSheet(
                             exportState.audioOnly,
                             exportState.isPhotoFrame
                         )?.let { intent ->
-                            context.startActivity(
-                                android.content.Intent.createChooser(intent, "Share export")
-                            )
+                            // A device with no share target throws ActivityNotFoundException,
+                            // which used to crash the editor right after a successful export.
+                            runCatching {
+                                context.startActivity(
+                                    android.content.Intent.createChooser(intent, "Share export")
+                                )
+                            }
                         }
                     },
                     onOpen = {
-                        val file = File(exportState.outputFilePath)
-                        if (file.exists()) {
-                            val intent = viewModel.buildShareExportIntent(
-                                exportState.outputFilePath,
-                                exportState.audioOnly,
-                                exportState.isPhotoFrame
-                            )
-                            if (intent != null) context.startActivity(intent)
+                        // ACTION_VIEW, not ACTION_SEND: Open must hand the file to a player.
+                        val intent = viewModel.buildViewExportIntent(
+                            exportState.outputFilePath,
+                            exportState.audioOnly,
+                            exportState.isPhotoFrame
+                        )
+                        if (intent != null) {
+                            val launched = runCatching { context.startActivity(intent) }.isSuccess
+                            if (!launched) {
+                                runCatching {
+                                    context.startActivity(
+                                        android.content.Intent.createChooser(intent, "Open with")
+                                    )
+                                }
+                            }
                         }
                     },
                     onDone = onDismiss,

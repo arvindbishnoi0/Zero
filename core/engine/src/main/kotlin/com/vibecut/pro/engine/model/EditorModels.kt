@@ -135,19 +135,44 @@ data class CropRect(
     }
 }
 
-/** Real OpenGL blend modes used for overlay / PIP clips in both preview and export. */
-enum class BlendMode(val label: String, val glCode: Int) {
-    NORMAL("Normal", 0),
-    SCREEN("Screen", 1),
-    MULTIPLY("Multiply", 2),
+/**
+ * Real separable blend modes used for overlay / PiP clips in both preview and export.
+ *
+ * [glCode] is the branch taken by `blendRgb()` in the master finishing shader. [fixedFunction]
+ * marks the modes that the GPU can also do with plain `glBlendFunc`/`glBlendEquation`, which is the
+ * fallback path when the compositor cannot hand the shader a backdrop texture.
+ */
+enum class BlendMode(
+    val label: String,
+    val glCode: Int,
+    /** Expressible exactly with OpenGL fixed-function blending (no backdrop sampler needed). */
+    val fixedFunction: Boolean = false
+) {
+    NORMAL("Normal", 0, fixedFunction = true),
+    SCREEN("Screen", 1, fixedFunction = true),
+    MULTIPLY("Multiply", 2, fixedFunction = true),
     OVERLAY("Overlay", 3),
-    ADD("Add", 4),
-    DARKEN("Darken", 5),
-    LIGHTEN("Lighten", 6);
+    ADD("Add", 4, fixedFunction = true),
+    DARKEN("Darken", 5, fixedFunction = true),
+    LIGHTEN("Lighten", 6, fixedFunction = true),
+    SOFT_LIGHT("Soft Light", 7),
+    HARD_LIGHT("Hard Light", 8),
+    DIFFERENCE("Difference", 9),
+    COLOR_DODGE("Color Dodge", 10),
+    COLOR_BURN("Color Burn", 11),
+    EXCLUSION("Exclusion", 12),
+    SUBTRACT("Subtract", 13),
+    HUE("Hue", 14),
+    COLOR("Color", 15),
+    LUMINOSITY("Luminosity", 16);
+
+    val isNormal: Boolean get() = this == NORMAL
 
     companion object {
         fun fromName(name: String?): BlendMode =
             entries.firstOrNull { it.name == name } ?: NORMAL
+
+        fun fromGlCode(code: Int): BlendMode = entries.firstOrNull { it.glCode == code } ?: NORMAL
     }
 }
 
@@ -784,12 +809,16 @@ data class TimelineClip(
         if (isFrozenFrame) return freezeFrameSourceMs.coerceIn(0L, sourceDurationMs)
         if (mediaKind == MediaKind.IMAGE) return localTimelineOffsetMs.coerceIn(0L, trimmedSourceDurationMs)
         val offset = localTimelineOffsetMs.coerceIn(0L, timelineDurationMs)
-        val srcOffset = if (hasSpeedRamp) {
-            (offset.toDouble() / TimelineClip.averageInverseSpeed(activeSpeedPoints)).roundToLong()
+        val sourceOffset = if (hasSpeedRamp) {
+            // Piecewise inversion of T(u) = rawSpan * integral(1/speed) — a constant mean would
+            // place every intermediate frame at the wrong source time inside the ramp.
+            val span = timelineDurationMs.toDouble()
+            val timelineFraction = if (span > 0.0) offset.toDouble() / span else 0.0
+            val u = TimelineClip.sourceFractionAtTimelineFraction(activeSpeedPoints, timelineFraction)
+            (u * trimmedSourceDurationMs).roundToLong()
         } else {
             (offset * clampedSpeed).roundToLong()
-        }
-        val sourceOffset = srcOffset.coerceIn(0L, trimmedSourceDurationMs)
+        }.coerceIn(0L, trimmedSourceDurationMs)
         return if (isReversed) {
             (effectiveTrimEndMs - sourceOffset).coerceIn(trimStartMs, effectiveTrimEndMs)
         } else {
@@ -806,11 +835,71 @@ data class TimelineClip(
             (sourceMs - trimStartMs).coerceIn(0L, trimmedSourceDurationMs)
         }
         val timeline = if (hasSpeedRamp) {
-            trimmedTarget.toDouble() * TimelineClip.averageInverseSpeed(activeSpeedPoints)
+            val rawSpan = trimmedSourceDurationMs.toDouble().coerceAtLeast(1.0)
+            val u = (trimmedTarget.toDouble() / rawSpan).coerceIn(0.0, 1.0)
+            val fraction = TimelineClip.timelineFractionAtSourceFraction(activeSpeedPoints, u)
+            fraction * timelineDurationMs.toDouble()
         } else {
             trimmedTarget.toDouble() / clampedSpeed
         }
         return timeline.roundToLong().coerceIn(0L, timelineDurationMs)
+    }
+
+    /**
+     * Splits a speed ramp into [segments] constant-rate slices. Each slice reports the source
+     * window it covers and the single playback rate that reproduces the curve over that window,
+     * which is exactly what Media3 / MediaCodec need (they cannot follow a continuous curve).
+     */
+    fun speedRampSegments(segments: Int = TimelineClip.RAMP_EXPORT_SEGMENTS): List<SpeedRampSlice> {
+        if (!hasSpeedRamp) {
+            return listOf(
+                SpeedRampSlice(
+                    sourceStartMs = trimStartMs,
+                    sourceEndMs = effectiveTrimEndMs,
+                    timelineStartMs = 0L,
+                    timelineEndMs = timelineDurationMs,
+                    speed = clampedSpeed
+                )
+            )
+        }
+        val n = segments.coerceIn(2, 64)
+        val rawSpan = trimmedSourceDurationMs
+        val out = ArrayList<SpeedRampSlice>(n)
+        var prevSourceOffset = 0L
+        var prevTimelineOffset = 0L
+        for (i in 1..n) {
+            val u = i.toFloat() / n
+            val sourceOffset = if (i == n) rawSpan else (u.toDouble() * rawSpan).roundToLong()
+            val timelineOffset = if (i == n) {
+                timelineDurationMs
+            } else {
+                (TimelineClip.timelineFractionAtSourceFraction(activeSpeedPoints, u.toDouble()) *
+                    timelineDurationMs).roundToLong()
+            }
+            val srcSpan = (sourceOffset - prevSourceOffset).coerceAtLeast(1L)
+            val tlSpan = (timelineOffset - prevTimelineOffset).coerceAtLeast(1L)
+            val rate = (srcSpan.toDouble() / tlSpan.toDouble()).toFloat()
+                .coerceIn(SpeedCurvePreset.MIN_SPEED, SpeedCurvePreset.MAX_SPEED)
+            val absStart: Long
+            val absEnd: Long
+            if (isReversed) {
+                absStart = (effectiveTrimEndMs - sourceOffset).coerceIn(trimStartMs, effectiveTrimEndMs)
+                absEnd = (effectiveTrimEndMs - prevSourceOffset).coerceIn(trimStartMs, effectiveTrimEndMs)
+            } else {
+                absStart = (trimStartMs + prevSourceOffset).coerceIn(trimStartMs, effectiveTrimEndMs)
+                absEnd = (trimStartMs + sourceOffset).coerceIn(trimStartMs, effectiveTrimEndMs)
+            }
+            out += SpeedRampSlice(
+                sourceStartMs = min(absStart, absEnd),
+                sourceEndMs = max(absStart, absEnd),
+                timelineStartMs = prevTimelineOffset,
+                timelineEndMs = timelineOffset,
+                speed = rate
+            )
+            prevSourceOffset = sourceOffset
+            prevTimelineOffset = timelineOffset
+        }
+        return out.filter { it.timelineEndMs > it.timelineStartMs && it.sourceEndMs > it.sourceStartMs }
     }
 
     /** Timeline offset at which the playback clock (Media3) advances by [hostSpeed]. */
@@ -821,6 +910,26 @@ data class TimelineClip(
 
     val isVisual: Boolean
         get() = mediaKind == MediaKind.VIDEO || mediaKind == MediaKind.IMAGE
+
+    /** Quarter turns currently applied by the user transform (0..3). */
+    val quarterTurns: Int
+        get() {
+            val norm = ((transform.rotationDegrees % 360f) + 360f) % 360f
+            return ((norm / 90f).roundToLong().toInt()) % 4
+        }
+
+    /** True when the user rotation swaps the framed width/height (90° or 270°). */
+    val rotationSwapsAxes: Boolean get() = quarterTurns % 2 == 1
+
+    /** Framed width after the non-destructive 90° rotation (source pixels stay untouched). */
+    val displayWidth: Int get() = if (rotationSwapsAxes) sourceHeight else sourceWidth
+
+    /** Framed height after the non-destructive 90° rotation. */
+    val displayHeight: Int get() = if (rotationSwapsAxes) sourceWidth else sourceHeight
+
+    /** Framed aspect ratio used for fit/fill decisions in preview and export. */
+    val displayAspectRatio: Float
+        get() = if (displayHeight > 0) displayWidth.toFloat() / displayHeight.toFloat() else 9f / 16f
 
     companion object {
         fun sampleSpeedCurve(sortedPoints: List<SpeedPoint>, u: Float): Float {
@@ -841,24 +950,107 @@ data class TimelineClip(
             return sortedPoints.last().speedMultiplier
         }
 
+        /** Resolution of the cumulative ramp integral. Higher = smoother scrubbing inside ramps. */
+        const val RAMP_INTEGRAL_STEPS: Int = 120
+
+        /** How many constant-rate slices a ramp is flattened into for export. */
+        const val RAMP_EXPORT_SEGMENTS: Int = 12
+
+        /**
+         * Cumulative inverse-speed integral, sampled with the midpoint rule.
+         *
+         * `table[i]` is the integral of `1/speed(v)` over `v in [0, i/RAMP_INTEGRAL_STEPS]`, so
+         * `table.last()` is the mean inverse speed and `table[i] / table.last()` is the fraction of
+         * the clip's timeline slot consumed by the first `i/steps` of its source.
+         */
+        fun inverseSpeedIntegralTable(points: List<SpeedPoint>): DoubleArray {
+            val steps = RAMP_INTEGRAL_STEPS
+            val table = DoubleArray(steps + 1)
+            if (points.size < 2) {
+                for (i in 0..steps) table[i] = i.toDouble() / steps
+                return table
+            }
+            val sorted = points.sortedBy { it.normalizedPosition }
+            var acc = 0.0
+            for (i in 1..steps) {
+                val mid = (i - 0.5f) / steps.toFloat()
+                val v = sampleSpeedCurve(sorted, mid)
+                    .coerceIn(SpeedCurvePreset.MIN_SPEED, SpeedCurvePreset.MAX_SPEED)
+                acc += (1.0 / v) / steps
+                table[i] = acc
+            }
+            return table
+        }
+
         /**
          * Mean of 1/speed over the curve. Bumping this constant invalidates every derived
          * timeline duration, so keep it fixed — changing it would silently retime saved projects.
          */
         fun averageInverseSpeed(points: List<SpeedPoint>): Double {
             if (points.size < 2) return 1.0
-            var sum = 0.0
-            val steps = 120
-            for (i in 0 until steps) {
-                val u = (i + 0.5f) / steps.toFloat()
-                sum += 1.0 / sampleSpeedCurve(points, u).coerceIn(SpeedCurvePreset.MIN_SPEED, SpeedCurvePreset.MAX_SPEED)
+            return inverseSpeedIntegralTable(points).last().coerceAtLeast(0.0001)
+        }
+
+        /**
+         * Fraction of the timeline slot consumed once [sourceFraction] of the source is played.
+         * Monotonically increasing from 0 to 1 — the exact inverse of
+         * [sourceFractionAtTimelineFraction].
+         */
+        fun timelineFractionAtSourceFraction(points: List<SpeedPoint>, sourceFraction: Double): Double {
+            val u = sourceFraction.coerceIn(0.0, 1.0)
+            if (points.size < 2) return u
+            val table = inverseSpeedIntegralTable(points)
+            val total = table.last()
+            if (total <= 0.0) return u
+            val steps = table.size - 1
+            val scaled = u * steps
+            val i = scaled.toInt().coerceIn(0, steps - 1)
+            val frac = (scaled - i).coerceIn(0.0, 1.0)
+            val value = table[i] + (table[i + 1] - table[i]) * frac
+            return (value / total).coerceIn(0.0, 1.0)
+        }
+
+        /** Source fraction reached after [timelineFraction] of the clip's timeline slot. */
+        fun sourceFractionAtTimelineFraction(points: List<SpeedPoint>, timelineFraction: Double): Double {
+            val t = timelineFraction.coerceIn(0.0, 1.0)
+            if (points.size < 2) return t
+            val table = inverseSpeedIntegralTable(points)
+            val total = table.last()
+            if (total <= 0.0) return t
+            val target = t * total
+            val steps = table.size - 1
+            // table is non-decreasing -> binary search the bracketing cell.
+            var lo = 0
+            var hi = steps
+            while (lo < hi) {
+                val mid = (lo + hi) / 2
+                if (table[mid] < target) lo = mid + 1 else hi = mid
             }
-            return (sum / steps).coerceAtLeast(0.0001)
+            if (lo == 0) return 0.0
+            val prev = table[lo - 1]
+            val cell = (table[lo] - prev)
+            val frac = if (cell > 1e-12) ((target - prev) / cell).coerceIn(0.0, 1.0) else 0.0
+            return (((lo - 1) + frac) / steps).coerceIn(0.0, 1.0)
         }
 
         /** Time compression ratio (timeline duration / source duration) for a speed ramp. */
         fun speedRampFactor(points: List<SpeedPoint>): Double = averageInverseSpeed(points)
     }
+}
+
+/**
+ * One constant-rate slice of a speed ramp. Encoders cannot follow a continuous curve, so ramps are
+ * flattened into a handful of these for both the preview playlist and the export pipeline.
+ */
+data class SpeedRampSlice(
+    val sourceStartMs: Long,
+    val sourceEndMs: Long,
+    val timelineStartMs: Long,
+    val timelineEndMs: Long,
+    val speed: Float
+) {
+    val sourceSpanMs: Long get() = max(1L, sourceEndMs - sourceStartMs)
+    val timelineSpanMs: Long get() = max(1L, timelineEndMs - timelineStartMs)
 }
 
 data class Track(
