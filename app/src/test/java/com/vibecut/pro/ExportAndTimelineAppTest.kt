@@ -61,7 +61,7 @@ class ExportAndTimelineAppTest {
 
     @Test
     fun effectStackingAndApplyToAllClipsPreserveIntegrity() {
-        var project = Project(title = "ZERO Reel", aspectRatio = AspectRatioPreset.WIDE_16_9)
+        var project = Project(title = "ZERO Reel", aspectRatio = AspectRatioPreset.YOUTUBE_16_9)
         val media = listOf(
             ImportedMediaSource("file:///a.mp4", "Scene A", MediaKind.VIDEO, 5_000L, hasAudioTrack = true),
             ImportedMediaSource("file:///b.mp4", "Scene B", MediaKind.VIDEO, 5_000L, hasAudioTrack = false)
